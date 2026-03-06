@@ -2081,334 +2081,6 @@ class App(tk.Tk):
         return
 
 
-        def _render_rows(rows: list[tuple]):
-            for r in rows:
-                self.tree.insert("", tk.END, values=r)
-
-        def _rows_from_dataframe(df):
-            want = ["filename", "date", "time", "duration_s", "latency_s", "beep_end_s", "speech_onset_s", "notes"]
-            for c in want:
-                if c not in df.columns:
-                    df[c] = ""
-            rows = []
-            for _, row in df.iterrows():
-                rows.append((
-                    str(row.get("filename", "")),
-                    str(row.get("date", "")),
-                    str(row.get("time", "")),
-                    str(row.get("duration_s", "")),
-                    str(row.get("latency_s", "")),
-                    str(row.get("beep_end_s", "")),
-                    str(row.get("speech_onset_s", "")),
-                    str(row.get("notes", "")),
-                ))
-            return rows
-
-        def _plot_dataframe(df):
-            if plt is None or FigureCanvasTkAgg is None:
-                return
-
-            if "filename" not in df.columns:
-                return
-
-            def to_num_series(series):
-                return pd.to_numeric(series, errors="coerce")
-
-            fn = df["filename"].astype(str)
-
-            def _clip_type(name: str) -> str:
-                base = name.rsplit("/", 1)[-1]
-                base = base.rsplit(".", 1)[0]
-                if base.startswith("self_feel_"):
-                    return "self_feel"
-                for sep in ("_", "-", " "):
-                    if sep in base:
-                        return base.split(sep, 1)[0]
-                return base
-
-            def _self_feel_score(name: str):
-                base = name.rsplit("/", 1)[-1]
-                base = base.rsplit(".", 1)[0]
-                if not base.startswith("self_feel_"):
-                    return None
-                try:
-                    return float(base[len("self_feel_"):])
-                except Exception:
-                    return None
-
-            df = df.copy()
-            df["clip_type"] = [_clip_type(x) for x in fn.tolist()]
-            df["self_feel_score"] = [_self_feel_score(x) for x in fn.tolist()]
-
-            # ---- Date-only x axis (voice drift measured once/day) ----
-            df = df.copy()
-            df["date_dt"] = pd.to_datetime(
-                df["date"].astype(str),
-                format="%Y%m%d",
-                errors="coerce"
-            )
-            df = df[df["date_dt"].notna()].sort_values("date_dt")
-            if len(df) == 0:
-                return
-            # Use python date objects (no timezone shift)
-            x = df["date_dt"].dt.date
-
-            dur = to_num_series(df.get("duration_s"))
-            lat = to_num_series(df.get("latency_s"))
-            scores = to_num_series(df.get("self_feel_score"))
-
-            win = tk.Toplevel(self)
-            win.title(f"Voice Drift — {user_id} (overall)")
-            win.geometry("1100x800")
-
-            fig = plt.Figure(figsize=(10.6, 7.4), dpi=100)
-
-            ax1 = fig.add_subplot(311)
-            ax2 = fig.add_subplot(312)
-            ax3 = fig.add_subplot(313)
-
-            types = sorted([t for t in df["clip_type"].unique() if t])
-
-            # -------- Duration (LINE ONLY) --------
-            for t in types:
-                if t == "self_feel":
-                    continue
-                mask = df["clip_type"] == t
-                ax1.plot(x[mask], dur[mask], label=t)
-
-            ax1.set_title("Duration per clip (s) by type")
-            ax1.set_xlabel("Clip index")
-            ax1.set_ylabel("Duration (s)")
-            ax1.grid(True, alpha=0.3)
-            ax1.legend(loc="best", fontsize=8)
-
-            # -------- Latency (LINE ONLY) --------
-            for t in types:
-                if t == "self_feel":
-                    continue
-                mask = df["clip_type"] == t
-                ax2.plot(x[mask], lat[mask], label=t)
-
-            ax2.set_title("Latency per clip (s) by type")
-            ax2.set_xlabel("Clip index")
-            ax2.set_ylabel("Latency (s)")
-            ax2.grid(True, alpha=0.3)
-            ax2.legend(loc="best", fontsize=8)
-
-            # -------- Self-feel Score (LINE ONLY) --------
-            mask_sf = df["clip_type"] == "self_feel"
-            if mask_sf.any():
-                ax3.plot(x[mask_sf], scores[mask_sf])
-                ax3.set_title("Self-feel score over time")
-            else:
-                ax3.set_title("Self-feel score (none found)")
-
-            ax3.set_xlabel("Clip index")
-            ax3.set_ylabel("Score")
-            ax3.grid(True, alpha=0.3)
-
-            fig.tight_layout()
-
-            canvas = FigureCanvasTkAgg(fig, master=win)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        def worker():
-            try:
-                if object_exists(self.s3, self.bucket, csv_key):
-                    csv_text = download_text_object(self.s3, self.bucket, csv_key)
-
-                    if pd is None:
-                        raise RuntimeError("pandas is required to parse the cached CSV (pip install pandas)")
-
-                    df_old = pd.read_csv(io.StringIO(csv_text))
-                    if "s3_key" not in df_old.columns:
-                        df_old["s3_key"] = ""
-
-                    existing_keys = set(str(x) for x in df_old["s3_key"].dropna().astype(str).tolist() if str(x).strip())
-
-                    # Scan for new voice_drift wavs not yet in the cached CSV.
-                    self.after(0, lambda: self._set_status("Cached CSV found; scanning for new voice_drift wavs…"))
-
-                    dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
-                    new_records = []
-
-                    for day in dates:
-                        vd_prefix = pick_voice_drift_prefix(layout, self.s3, self.bucket, user_id, day)
-                        if not vd_prefix:
-                            continue
-
-                        objs = list_objects(self.s3, self.bucket, vd_prefix, max_items=5000)
-                        keys = [o.get("Key") for o in objs if o.get("Key")]
-                        done_key = next((k for k in keys if k.lower().endswith("_done.json")), None)
-                        wav_keys = sorted([k for k in keys if k.lower().endswith(".wav")])
-
-                        if not wav_keys:
-                            continue
-
-                        time_str = "--:--:--"
-                        date_str = day
-                        if done_key:
-                            try:
-                                done = json.loads(download_text_object(self.s3, self.bucket, done_key))
-                                date_str = str(done.get("day", day))
-                                ts = done.get("created_at_unix")
-                                if ts is not None:
-                                    dt = datetime.fromtimestamp(float(ts))
-                                    time_str = dt.strftime("%H:%M:%S")
-                            except Exception:
-                                pass
-
-                        for k in wav_keys:
-                            if k in existing_keys:
-                                continue
-
-                            fname = k.split("/")[-1]
-                            w = self.s3.get_object(Bucket=self.bucket, Key=k)
-                            wav_bytes = w["Body"].read()
-
-                            sr, x = _read_wav_mono_float32(wav_bytes)
-                            duration_s = float(x.size) / float(sr) if sr > 0 else 0.0
-
-                            latency_s, beep_end_s, speech_onset_s, notes = estimate_latency_beep_to_speech(x, sr)
-
-                            new_records.append({
-                                "filename": fname,
-                                "date": date_str,
-                                "time": time_str,
-                                "duration_s": float(f"{duration_s:.2f}"),
-                                "latency_s": (None if latency_s is None else float(f"{latency_s:.3f}")),
-                                "beep_end_s": (None if beep_end_s is None else float(f"{beep_end_s:.3f}")),
-                                "speech_onset_s": (None if speech_onset_s is None else float(f"{speech_onset_s:.3f}")),
-                                "notes": notes,
-                                "s3_key": k,
-                            })
-
-                    if not new_records:
-                        rows = _rows_from_dataframe(df_old)
-
-                        def ui_update_cached_only():
-                            _render_rows(rows)
-                            self._set_status(f"Loaded cached voice drift CSV ({len(rows)} rows). No new clips found.")
-                            _plot_dataframe(df_old)
-
-                        self.after(0, ui_update_cached_only)
-                        return
-
-                    df_new = pd.DataFrame(new_records)
-                    df_all = pd.concat([df_old, df_new], ignore_index=True)
-
-                    for col in ("date", "time", "filename"):
-                        if col not in df_all.columns:
-                            df_all[col] = ""
-                    df_all = df_all.sort_values(["date", "time", "filename"], kind="mergesort").reset_index(drop=True)
-
-                    buf = io.StringIO()
-                    df_all.to_csv(buf, index=False)
-                    upload_text_object(self.s3, self.bucket, csv_key, buf.getvalue(), content_type="text/csv")
-
-                    rows = _rows_from_dataframe(df_all)
-
-                    def ui_update_appended():
-                        _render_rows(rows)
-                        self._set_status(
-                            f"Appended {len(df_new)} new clips; updated cached CSV now has {len(df_all)} rows."
-                        )
-                        _plot_dataframe(df_all)
-
-                    self.after(0, ui_update_appended)
-                    return
-
-                self.after(0, lambda: self._set_status("No cached CSV found; computing voice drift across all days…"))
-
-                dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
-                out_records = []
-
-                for day in dates:
-                    vd_prefix = pick_voice_drift_prefix(layout, self.s3, self.bucket, user_id, day)
-                    if not vd_prefix:
-                        continue
-
-                    objs = list_objects(self.s3, self.bucket, vd_prefix, max_items=5000)
-                    keys = [o.get("Key") for o in objs if o.get("Key")]
-                    done_key = next((k for k in keys if k.lower().endswith("_done.json")), None)
-                    wav_keys = sorted([k for k in keys if k.lower().endswith(".wav")])
-
-                    if not wav_keys:
-                        continue
-
-                    time_str = "--:--:--"
-                    date_str = day
-                    if done_key:
-                        try:
-                            done = json.loads(download_text_object(self.s3, self.bucket, done_key))
-                            date_str = str(done.get("day", day))
-                            ts = done.get("created_at_unix")
-                            if ts is not None:
-                                dt = datetime.fromtimestamp(float(ts))
-                                time_str = dt.strftime("%H:%M:%S")
-                        except Exception:
-                            pass
-
-                    for k in wav_keys:
-                        fname = k.split("/")[-1]
-                        w = self.s3.get_object(Bucket=self.bucket, Key=k)
-                        wav_bytes = w["Body"].read()
-
-                        sr, x = _read_wav_mono_float32(wav_bytes)
-                        duration_s = float(x.size) / float(sr) if sr > 0 else 0.0
-
-                        latency_s, beep_end_s, speech_onset_s, notes = estimate_latency_beep_to_speech(x, sr)
-
-                        out_records.append({
-                            "filename": fname,
-                            "date": date_str,
-                            "time": time_str,
-                            "duration_s": float(f"{duration_s:.2f}"),
-                            "latency_s": (None if latency_s is None else float(f"{latency_s:.3f}")),
-                            "beep_end_s": (None if beep_end_s is None else float(f"{beep_end_s:.3f}")),
-                            "speech_onset_s": (None if speech_onset_s is None else float(f"{speech_onset_s:.3f}")),
-                            "notes": notes,
-                            "s3_key": k,
-                        })
-
-                if not out_records:
-                    self.after(0, lambda: self._set_status("No voice_drift wavs found for this user."))
-                    self.after(0, lambda: messagebox.showinfo("No data", f"No voice_drift data found under {user_root}"))
-                    return
-
-                if pd is None:
-                    raise RuntimeError("pandas is required to write the aggregated CSV (pip install pandas)")
-
-                df = pd.DataFrame(out_records)
-                for col in ("date", "time", "filename"):
-                    if col not in df.columns:
-                        df[col] = ""
-                df = df.sort_values(["date", "time", "filename"], kind="mergesort").reset_index(drop=True)
-
-                buf = io.StringIO()
-                df.to_csv(buf, index=False)
-                upload_text_object(self.s3, self.bucket, csv_key, buf.getvalue(), content_type="text/csv")
-
-                rows = _rows_from_dataframe(df)
-
-                def ui_update2():
-                    _render_rows(rows)
-                    self._set_status(f"Computed {len(rows)} clips and uploaded cached CSV to {csv_key}.")
-                    _plot_dataframe(df)
-
-                self.after(0, ui_update2)
-
-            except (BotoCoreError, ClientError) as e:
-                self.after(0, lambda: self._set_status(f"S3 error: {e}"))
-                self.after(0, lambda: messagebox.showerror("S3 error", str(e)))
-            except Exception as e:
-                self.after(0, lambda: self._set_status(f"Error: {e}"))
-                self.after(0, lambda: messagebox.showerror("Error", str(e)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
 
 def main():
     App().mainloop()
@@ -2846,6 +2518,8 @@ class S3TaggerWindow:
         self.phase_heart = None
         self.est_rr_bpm = None
         self.est_hr_bpm = None
+        self.radar_hr_t = None   # sliding-window HR time axis (epoch_s, for E4 comparison)
+        self.radar_hr_bpm = None  # sliding-window HR estimates (bpm)
         self.phase_bin_m = None
         self.phase_bin_idx = None
         self.canvas = None
@@ -3156,6 +2830,8 @@ class S3TaggerWindow:
             self.phase_heart = None
             self.est_rr_bpm = None
             self.est_hr_bpm = None
+            self.radar_hr_t = None
+            self.radar_hr_bpm = None
             self.phase_bin_m = None
             self.phase_bin_idx = None
 
@@ -3743,34 +3419,31 @@ class S3TaggerWindow:
         except Exception:
             return
 
-        if self.phase_t is None or self.phase_unwrap is None or len(self.phase_unwrap) < 4:
-            self.ax1.set_title("Phase (not available)")
-            self.ax1.set_xlabel("Time (s)")
-            self.ax1.set_ylabel("Phase (rad)")
+        radar_hr_t = getattr(self, "radar_hr_t", None)
+        radar_hr_bpm = getattr(self, "radar_hr_bpm", None)
+        if radar_hr_t is None or radar_hr_bpm is None or len(radar_hr_t) < 2:
+            self.ax1.set_title("Radar HR — 30 s window (not available)")
+            self.ax1.set_xlabel("epoch_s")
+            self.ax1.set_ylabel("HR (bpm)")
             try:
                 self.canvas.draw()
             except Exception:
                 pass
             return
 
-        t = self.phase_t
-        ph = self.phase_unwrap
+        # Plot sliding-window HR time series (epoch_s x-axis matches E4 HR panel).
+        mask = np.isfinite(radar_hr_bpm)
+        (self.phase_line,) = self.ax1.plot(
+            radar_hr_t[mask], radar_hr_bpm[mask], label="Radar HR (30 s window)"
+        )
 
-        # Main phase
-        (self.phase_line,) = self.ax1.plot(t, ph, label="phase (unwrap)")
-
-        # Overlay band components if available
-        if self.phase_resp is not None and len(self.phase_resp) == len(ph):
-            (self.resp_line,) = self.ax1.plot(t, self.phase_resp, label="resp band")
-        if self.phase_heart is not None and len(self.phase_heart) == len(ph):
-            (self.heart_line,) = self.ax1.plot(t, self.phase_heart, label="heart band")
-
-        # Vertical cursor synced to the current frame (time axis).
+        # Vertical cursor synced to the current frame (epoch_s).
         try:
-            _i = int(max(0, min(int(getattr(self, "current_frame", 0)), len(t) - 1)))
-            cur_t = float(t[_i])
+            _i = int(max(0, min(int(getattr(self, "current_frame", 0)),
+                                len(self.timestamps) - 1)))
+            cur_t = float(self.timestamps[_i])
         except Exception:
-            cur_t = float(t[0])
+            cur_t = float(radar_hr_t[0])
         if getattr(self, "phase_cursor", None) is None:
             self.phase_cursor = self.ax1.axvline(cur_t, linestyle="--", linewidth=1.0, alpha=0.9)
         else:
@@ -3783,7 +3456,6 @@ class S3TaggerWindow:
                     pass
                 self.phase_cursor = self.ax1.axvline(cur_t, linestyle="--", linewidth=1.0, alpha=0.9)
 
-
         rr = self.est_rr_bpm
         hr = self.est_hr_bpm
         bin_m = self.phase_bin_m
@@ -3793,12 +3465,12 @@ class S3TaggerWindow:
         if rr is not None:
             parts.append(f"RR≈{rr:.1f} bpm")
         if hr is not None:
-            parts.append(f"HR≈{hr:.1f} bpm")
+            parts.append(f"HR≈{hr:.1f} bpm (session)")
         suffix = (" — " + ", ".join(parts)) if parts else ""
-        self.ax1.set_title("Phase / vitals" + suffix)
+        self.ax1.set_title("Radar HR — 30 s window" + suffix)
 
-        self.ax1.set_xlabel("Time (s)")
-        self.ax1.set_ylabel("Phase (rad)")
+        self.ax1.set_xlabel("epoch_s (aligned with E4)")
+        self.ax1.set_ylabel("HR (bpm)")
         try:
             self.ax1.legend(loc="upper right", fontsize=8)
         except Exception:
@@ -3812,11 +3484,11 @@ class S3TaggerWindow:
         """Update (or create) the vertical cursor line on the phase plot (ax1)."""
         if self.ax1 is None or self.canvas is None:
             return
-        if self.phase_t is None or len(self.phase_t) == 0:
+        if getattr(self, "timestamps", None) is None or len(self.timestamps) == 0:
             return
         try:
-            i = int(max(0, min(int(idx), len(self.phase_t) - 1)))
-            cur_t = float(self.phase_t[i])
+            i = int(max(0, min(int(idx), len(self.timestamps) - 1)))
+            cur_t = float(self.timestamps[i])
         except Exception:
             return
 
@@ -3871,16 +3543,25 @@ class S3TaggerWindow:
 
 
     def _bandpass_via_fft(self, x: np.ndarray, fs_hz: float, f_lo: float, f_hi: float) -> np.ndarray:
-        """Simple bandpass using FFT masking (no scipy)."""
+        """Zero-phase Butterworth bandpass (scipy); falls back to FFT mask if scipy unavailable."""
         n = int(x.size)
         if n < 4 or fs_hz <= 0:
             return np.zeros_like(x)
-        X = np.fft.rfft(x)
-        freqs = np.fft.rfftfreq(n, d=1.0 / fs_hz)
-        mask = (freqs >= float(f_lo)) & (freqs <= float(f_hi))
-        Xf = X * mask
-        y = np.fft.irfft(Xf, n=n)
-        return y.astype(np.float32)
+        try:
+            from scipy.signal import butter, filtfilt
+            nyq = fs_hz / 2.0
+            lo = max(1e-4, float(f_lo) / nyq)
+            hi = min(0.9999, float(f_hi) / nyq)
+            lo = min(lo, hi - 1e-4)
+            b, a = butter(4, [lo, hi], btype='band')
+            padlen = min(3 * max(len(a), len(b)), n - 1)
+            return filtfilt(b, a, x.astype(np.float64), padlen=padlen).astype(np.float32)
+        except Exception:
+            # Fallback: rectangular FFT mask
+            X = np.fft.rfft(x)
+            freqs = np.fft.rfftfreq(n, d=1.0 / fs_hz)
+            mask = (freqs >= float(f_lo)) & (freqs <= float(f_hi))
+            return np.fft.irfft(X * mask, n=n).astype(np.float32)
 
     def _estimate_peak_bpm(self, x: np.ndarray, fs_hz: float, f_lo: float, f_hi: float) -> float | None:
         """Estimate dominant frequency in [f_lo,f_hi] and return bpm."""
@@ -3900,6 +3581,40 @@ class S3TaggerWindow:
             return None
         return float(f_peak * 60.0)
 
+    def _estimate_hr_notched(self, x: np.ndarray, fs_hz: float,
+                              rr_hz: float | None,
+                              notch_bw_hz: float = 0.05) -> float | None:
+        """Estimate HR peak in 0.8–2.5 Hz after notching out RR harmonics.
+
+        For each integer multiple n*rr_hz that falls inside the HR band,
+        PSD bins within ±notch_bw_hz are zeroed before peak search.
+        This prevents strong respiration harmonics from masquerading as
+        a heartbeat peak.
+        """
+        n = int(x.size)
+        if n < 8 or fs_hz <= 0:
+            return None
+        win = np.hanning(n).astype(np.float32)
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs_hz)
+        X = np.fft.rfft((x.astype(np.float64) - float(np.mean(x))) * win)
+        P = (np.abs(X) ** 2)
+        # Notch every harmonic of rr_hz that lands in the HR band
+        if rr_hz is not None and rr_hz > 0:
+            for harmonic_n in range(2, 25):
+                h = rr_hz * harmonic_n
+                if h > 2.50:
+                    break
+                if h < 0.80:
+                    continue
+                P[np.abs(freqs - h) <= notch_bw_hz] = 0.0
+        band = (freqs >= 0.80) & (freqs <= 2.50)
+        if not np.any(band) or not np.any(P[band] > 0):
+            return None
+        f_peak = float(freqs[band][np.argmax(P[band])])
+        if not np.isfinite(f_peak) or f_peak <= 0:
+            return None
+        return float(f_peak * 60.0)
+
     def _compute_phase_and_rates(self):
         """Compute unwrapped phase across frames + RR/HR estimates from phase."""
         self.phase_t = None
@@ -3908,6 +3623,8 @@ class S3TaggerWindow:
         self.phase_heart = None
         self.est_rr_bpm = None
         self.est_hr_bpm = None
+        self.radar_hr_t = None
+        self.radar_hr_bpm = None
         self.phase_bin_m = None
 
         if self.df is None or self.timestamps is None or self.range_axis is None or self.N <= 3:
@@ -3984,11 +3701,37 @@ class S3TaggerWindow:
 
         # Band components
         self.phase_resp = self._bandpass_via_fft(ph_d, fs_hz=fs, f_lo=0.10, f_hi=0.60)
-        self.phase_heart = self._bandpass_via_fft(ph_d, fs_hz=fs, f_lo=0.80, f_hi=2.50)
+        # Remove the fundamental respiration component before HR bandpass to reduce
+        # harmonic contamination (2nd harmonic of 0.60 Hz = 1.20 Hz falls inside HR band).
+        ph_no_resp = ph_d - self.phase_resp
+        self.phase_heart = self._bandpass_via_fft(ph_no_resp, fs_hz=fs, f_lo=0.80, f_hi=2.50)
 
-        # Rate estimates (bpm)
+        # Rate estimates (bpm) — whole-session summary values
         self.est_rr_bpm = self._estimate_peak_bpm(ph_d, fs_hz=fs, f_lo=0.10, f_hi=0.60)
-        self.est_hr_bpm = self._estimate_peak_bpm(ph_d, fs_hz=fs, f_lo=0.80, f_hi=2.50)
+        rr_hz_session = (self.est_rr_bpm / 60.0) if self.est_rr_bpm is not None else None
+        self.est_hr_bpm = self._estimate_hr_notched(ph_no_resp, fs_hz=fs, rr_hz=rr_hz_session)
+
+        # Sliding-window HR time series (30 s window, 2 s step) for comparison with E4.
+        win_s = 30.0
+        step_s = 2.0
+        n_win = int(win_s * fs)
+        n_step = max(1, int(step_s * fs))
+        if n_win >= 8 and len(ph_d) >= n_win:
+            t_abs_start = float(self.timestamps[0])
+            hr_t_list: list[float] = []
+            hr_bpm_list: list[float] = []
+            for end in range(n_win, len(ph_d) + 1, n_step):
+                seg = ph_d[end - n_win : end]
+                seg_resp = self._bandpass_via_fft(seg, fs_hz=fs, f_lo=0.10, f_hi=0.60)
+                seg_no_resp = seg - seg_resp
+                # Estimate local RR per window for adaptive harmonic notching
+                local_rr_bpm = self._estimate_peak_bpm(seg, fs_hz=fs, f_lo=0.10, f_hi=0.60)
+                local_rr_hz = (local_rr_bpm / 60.0) if local_rr_bpm is not None else rr_hz_session
+                bpm = self._estimate_hr_notched(seg_no_resp, fs_hz=fs, rr_hz=local_rr_hz)
+                hr_t_list.append(t_abs_start + float(t[end - 1]))
+                hr_bpm_list.append(np.nan if bpm is None else float(bpm))
+            self.radar_hr_t = np.array(hr_t_list, dtype=np.float64)
+            self.radar_hr_bpm = np.array(hr_bpm_list, dtype=np.float64)
 
 
     # ---------- View update ----------
