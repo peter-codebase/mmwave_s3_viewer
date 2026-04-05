@@ -1,0 +1,34 @@
+Activities selected: ['drinking', 'face_washing', 'hair_washing', 'hand_washing', 'no_motion', 'sit_to_stand', 'stand_to_sit', 'standing', 'tooth_brushing', 'walk_away', 'walk_close']
+Window=32 frames, stride=16 frames  (¡Ö 6.4s at 5 Hz)
+
+  drinking              : 177 segments ¡ú  354 windows
+  face_washing          :  60 segments ¡ú  154 windows
+  hair_washing          :  91 segments ¡ú  316 windows
+  hand_washing          :  63 segments ¡ú  153 windows
+  no_motion             :  52 segments ¡ú  129 windows
+  sit_to_stand          : 176 segments ¡ú  176 windows
+  stand_to_sit          : 176 segments ¡ú  176 windows
+  standing              : 102 segments ¡ú  213 windows
+  tooth_brushing        :  61 segments ¡ú  148 windows
+  walk_away             : 166 segments ¡ú  166 windows
+  walk_close            : 161 segments ¡ú  161 windows
+
+©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+X shape : (2146, 32, 64, 64, 5)
+          ©¸©¤ 2146 windows  ¡Á  32 frames  ¡Á  64 range bins  ¡Á  64 Doppler bins  ¡Á  5 channels
+y shape : (2146,)
+Size    : 5625.6 MB uncompressed
+Saved   ¡ú data\adl_features\peter\adl_features.npz
+
+Windows per class:
+  drinking              :  354  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  face_washing          :  154  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  hair_washing          :  316  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  hand_washing          :  153  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  no_motion             :  129  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  sit_to_stand          :  176  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  stand_to_sit          :  176  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  standing              :  213  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  tooth_brushing        :  148  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  walk_away             :  166  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€
+  walk_close            :  161  ¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€¨€

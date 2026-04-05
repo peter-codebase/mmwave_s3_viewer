@@ -1,0 +1,58 @@
+*******************************************************
+F0 mean (Hz) — "Pitch"
+
+The fundamental frequency of the voice — how fast the vocal cords vibrate per second. Lower = deeper voice.
+
+> Normal male: 85–180 Hz | Normal female: 165–255 Hz
+> Why it matters clinically: Parkinson's causes vocal cord rigidity → F0 drops and becomes monotone over time. ALS causes weakness → similar effect.
+
+*******************************************************
+F0 range (Hz) — "Pitch expressiveness"
+
+The spread between the 5th and 95th percentile of F0 across frames within one clip. A wide range means the voice goes up and down naturally (intonation); a narrow range means monotone speech.
+
+> Why it matters: Loss of F0 variation (monotone speech) is one of the earliest vocal signs of Parkinson's hypophonia, often appearing before tremor.
+
+*******************************************************
+Jitter (%) — "Pitch stability cycle-to-cycle"
+
+How much the vocal cord vibration period varies from one cycle to the next, expressed as a percentage of the average period.
+
+> Normal (sustained "ah"): < 1% | Pathological: > 1%
+> Only meaningful on sustained vowels ("ah"). High jitter on running speech just reflects natural intonation change.
+Why it matters: Tremor, incomplete vocal fold closure, or neuromuscular instability all increase jitter. It's sensitive to early Parkinson's and ALS progression.
+
+*******************************************************
+Shimmer (%) — "Loudness stability cycle-to-cycle"
+
+How much the amplitude (loudness) of each vocal cycle varies from the next one, as a percentage of mean amplitude.
+
+> Normal (sustained "ah"): < 3.8% | Pathological: > 6.5%
+> Also most meaningful on "ah", same reasoning as jitter.
+> Why it matters: Reflects vocal fold closure irregularity and breath support. Poor breath control (Parkinson's, ALS) → higher shimmer.
+
+*******************************************************
+HNR (dB) — "Voice cleanliness"
+
+Harmonics-to-Noise Ratio: how much of the voice signal is structured harmonic sound (the "musical" part of speech) versus random noise (breathiness, hoarseness).
+
+> Normal sustained vowel: 10–20 dB | Dysphonic/breathy: < 7 dB
+> Works well on all clip types — running speech, reading, sustained vowels.
+> Why it matters: Neurological voice disorders → vocal folds don't close cleanly → more air turbulence → lower HNR. This is often the most sensitive longitudinal marker because it degrades gradually and consistently.
+
+*******************************************************
+Voiced ratio — "How much of the clip is speech"
+
+Fraction of analysis frames where the algorithm detected periodic vocal fold vibration (0 = silent/whisper, 1 = fully voiced throughout).
+
+>Why it matters: Hypophonia (soft speech) in Parkinson's often starts as reduced phonation time — more pauses, shorter sentences, more unvoiced segments. A dropping voiced ratio over months is an early warning sign.
+
+*******************************************************
+Practical priority for your research
+
+Clip type                          Most reliable metrics               Less reliable
+"ah"                               Jitter, Shimmer, HNR, F0 mean       —
+"read", "count", "conversation"    HNR, F0 mean, Voiced ratio          Jitter, Shimmer
+
+The HNR of the "ah" clip tracked over months is probably your single best early-warning signal for neurological voice drift.
+*******************************************************

@@ -613,8 +613,8 @@ from dotenv import dotenv_values
 ROOT_PREFIX_DEFAULT = "sleep/"
 
 # ---------------- Empatica E4 decode helpers (from e4_decoder_plot.py) ----------------
-E4_TEMP_SCALE = 0.02864
-E4_TEMP_OFFSET = -400.9
+E4_TEMP_SCALE = 0.02
+E4_TEMP_OFFSET = -273.15
 
 def _e4_hx_to_bytes(hx: str) -> bytes:
     hx = str(hx).strip()
@@ -1627,13 +1627,20 @@ class App(tk.Tk):
             E = P[:, mask].sum(axis=1) + 1e-12
             return (10.0 * np.log10(E)).astype(np.float32)
 
-        sn_db = band_db(*snore_band_hz)
+        sn_db  = band_db(*snore_band_hz)
         mid_db = band_db(*mid_band_hz)
-        score = (sn_db - mid_db).astype(np.float32)
-        sn_rel = (sn_db - float(np.max(sn_db))).astype(np.float32)
+        # Harmonic bonus: snore has a clear 2:1 harmonic structure (~76 Hz + ~152 Hz).
+        # Reward frames where the 2nd harmonic region (140-280 Hz) is as strong as the
+        # fundamental region (70-150 Hz); pure low-frequency noise will not have this.
+        sub_db  = band_db(70.0,  150.0)
+        harm_db = band_db(140.0, 280.0)
+        h_bonus = np.clip(harm_db - sub_db + 3.0, 0.0, 8.0).astype(np.float32)
+        score   = (sn_db - mid_db + h_bonus).astype(np.float32)
+        sn_rel  = (sn_db - float(np.max(sn_db))).astype(np.float32)
 
         t_mid = [((i * hl + 0.5 * fl) / float(sr)) for i in range(n_frames)]
-        return t_mid, score, sn_rel
+        rms = float(np.sqrt(np.mean(x[:n_frames * hl] ** 2) + 1e-30))
+        return t_mid, score, sn_rel, rms
 
     @staticmethod
     def _detect_snore_events(
@@ -1641,26 +1648,43 @@ class App(tk.Tk):
         score_db: np.ndarray,
         snore_db_rel: np.ndarray,
         hop_s: float,
-        k_mad: float = 1.5,
-        rel_floor_db: float = -25.0,
-        min_len_s: float = 0.30,
-        max_gap_s: float = 0.30,
+        k_mad: float = 3.0,
+        rel_floor_db: float = -30.0,
+        min_len_s: float = 0.50,
+        max_gap_s: float = 2.0,
+        rms_floor: float = 5e-4,
+        signal_rms: float = 0.0,
     ) -> list[tuple[float, float]]:
         """Detect snore-like events from a snore score series.
 
-        Heuristic:
-          - adaptive threshold: median(score) + k_mad * 1.4826 * MAD
-          - and snore-band must not be extremely quiet: snore_db_rel >= rel_floor_db
-          - merge across short gaps
+        Uses a rolling 60s adaptive threshold (local median + k_mad * MAD) so the
+        detector adjusts to room noise that changes throughout a recording.
+        Falls back to global median+MAD if scipy is unavailable.
+
+        rms_floor: minimum overall RMS (normalised −1…1 scale) to bother detecting.
+                   Recordings below this level are pure noise — return nothing.
+        signal_rms: overall RMS of the audio passed in (from _snore_score_series).
         """
         if score_db.size == 0 or not t:
             return []
+        # Absolute silence gate: if the whole file is noise-floor, skip detection.
+        if signal_rms < rms_floor:
+            return []
 
-        med = float(np.median(score_db))
-        mad = float(np.median(np.abs(score_db - med))) + 1e-9
-        thr = med + float(k_mad) * 1.4826 * mad
+        # Rolling 60-second adaptive threshold
+        try:
+            from scipy.ndimage import median_filter as _mf
+            n_local = max(3, int(round(60.0 / float(hop_s))))
+            _sd = score_db.astype(np.float64)
+            local_med = _mf(_sd, size=n_local, mode="reflect")
+            local_mad = _mf(np.abs(_sd - local_med), size=n_local, mode="reflect") + 1e-9
+            thr_arr = (local_med + float(k_mad) * 1.4826 * local_mad).astype(np.float32)
+        except Exception:
+            med = float(np.median(score_db))
+            mad = float(np.median(np.abs(score_db - med))) + 1e-9
+            thr_arr = np.full_like(score_db, med + float(k_mad) * 1.4826 * mad)
 
-        above = (score_db >= thr) & (snore_db_rel >= float(rel_floor_db))
+        above = (score_db >= thr_arr) & (snore_db_rel >= float(rel_floor_db))
         if not np.any(above):
             return []
 
@@ -1696,6 +1720,74 @@ class App(tk.Tk):
                     t1 = t0 + float(hop_s)
                 events.append((t0, t1))
 
+        return events
+
+    @staticmethod
+    def _detect_apnea_events(
+        x: np.ndarray,
+        sr: int,
+        win_s: float = 1.0,
+        hop_s: float = 0.5,
+        local_window_s: float = 60.0,
+        silence_ratio: float = 0.15,
+        min_apnea_s: float = 8.0,
+        max_merge_gap_s: float = 2.0,
+    ) -> list[tuple[float, float]]:
+        """Detect apnea candidates: windows where RMS falls below silence_ratio * local 60s
+        baseline for at least min_apnea_s seconds.  Uses relative (not absolute) silence so
+        it works regardless of microphone gain or recording distance.
+        """
+        if sr <= 0 or x.size == 0:
+            return []
+        try:
+            from scipy.ndimage import median_filter as _mf
+        except ImportError:
+            return []
+
+        win = max(1, int(round(win_s * sr)))
+        hop = max(1, int(round(hop_s * sr)))
+        x64 = x.astype(np.float64)
+        rms_list: list[float] = []
+        t_list:   list[float] = []
+        i = 0
+        while i + win <= x64.size:
+            seg = x64[i:i + win]
+            rms_list.append(float(np.sqrt(np.mean(seg * seg) + 1e-12)))
+            t_list.append((i + 0.5 * win) / float(sr))
+            i += hop
+        if not rms_list:
+            return []
+
+        rms_arr = np.array(rms_list, dtype=np.float64)
+        t_arr   = np.array(t_list,   dtype=np.float64)
+        n_local = max(3, int(round(local_window_s / hop_s)))
+        baseline = _mf(rms_arr, size=n_local, mode="reflect")
+        silence_mask = rms_arr < (float(silence_ratio) * baseline + 1e-9)
+
+        n_f = len(silence_mask)
+        gap_frames = max(1, int(round(max_merge_gap_s / hop_s)))
+        min_frames = max(1, int(round(min_apnea_s / hop_s)))
+        events: list[tuple[float, float]] = []
+        i = 0
+        while i < n_f:
+            if not silence_mask[i]:
+                i += 1
+                continue
+            start = i
+            last  = i
+            i += 1
+            gap = 0
+            while i < n_f:
+                if silence_mask[i]:
+                    last = i
+                    gap  = 0
+                else:
+                    gap += 1
+                    if gap > gap_frames:
+                        break
+                i += 1
+            if (last - start + 1) >= min_frames:
+                events.append((float(t_arr[start]), float(t_arr[min(last + 1, n_f - 1)])))
         return events
 
     def _open_sound_plot_window(self, plot_items: list[dict]):
@@ -1756,7 +1848,7 @@ class App(tk.Tk):
         hdr.pack(fill="x", padx=10, pady=(10, 6))
         ttk.Label(
             hdr,
-            text="Each row: 1) RMS power (dBFS)  2) Snore score (band(80–300Hz)-band(300–1200Hz))  3) Shaded snore events",
+            text="Each row: RMS power (dBFS) + Snore score (blue shade) + Apnea candidates (red shade)",
             font=("TkDefaultFont", 10, "bold"),
         ).pack(anchor="w")
 
@@ -1768,7 +1860,8 @@ class App(tk.Tk):
                 f"{item.get('wav','')}   "
                 f"[{item.get('start','--:--:--')} → {item.get('end','--:--:--')}]   "
                 f"dur={item.get('duration_s','0')}s   "
-                f"snore_events={item.get('snore_count','0')} ({item.get('snore_seconds','0')}s)"
+                f"snore={item.get('snore_count','0')} events ({item.get('snore_seconds','0')}s)   "
+                f"apnea={item.get('apnea_count','0')} events ({item.get('apnea_seconds','0')}s)"
             )
             ttk.Label(row, text=title).pack(anchor="w")
 
@@ -1793,10 +1886,12 @@ class App(tk.Tk):
             else:
                 ax2 = None
 
-            # Shade snore events
-            events = item.get("snore_events", []) or []
-            for (a, b) in events:
-                ax1.axvspan(float(a), float(b), alpha=0.18)
+            # Shade snore events (blue)
+            for (a, b) in (item.get("snore_events", []) or []):
+                ax1.axvspan(float(a), float(b), alpha=0.18, color="steelblue")
+            # Shade apnea candidates (red)
+            for (a, b) in (item.get("apnea_events", []) or []):
+                ax1.axvspan(float(a), float(b), alpha=0.22, color="tomato")
 
             fc = FigureCanvasTkAgg(fig, master=row)
             w = fc.get_tk_widget()
@@ -1823,7 +1918,8 @@ class App(tk.Tk):
             messagebox.showerror("Not found", f"No day folder found for {user_id}-{day}.")
             return
 
-        cols = ("wav", "start", "end", "duration_s", "rms", "peak", "power_db", "snore_count", "snore_seconds")
+        cols = ("wav", "start", "end", "duration_s", "rms", "peak", "power_db",
+                "snore_count", "snore_seconds", "apnea_count", "apnea_seconds")
         headings = {
             "wav": "wav",
             "start": "start",
@@ -1834,20 +1930,24 @@ class App(tk.Tk):
             "power_db": "power (dBFS)",
             "snore_count": "snore #",
             "snore_seconds": "snore (s)",
+            "apnea_count": "apnea #",
+            "apnea_seconds": "apnea (s)",
         }
         widths = {
-            "wav": 360,
-            "start": 90,
-            "end": 90,
-            "duration_s": 110,
-            "rms": 100,
-            "peak": 100,
-            "power_db": 120,
-            "snore_count": 90,
-            "snore_seconds": 100,
+            "wav": 300,
+            "start": 80,
+            "end": 80,
+            "duration_s": 100,
+            "rms": 90,
+            "peak": 90,
+            "power_db": 110,
+            "snore_count": 80,
+            "snore_seconds": 90,
+            "apnea_count": 80,
+            "apnea_seconds": 90,
         }
         anchors = {c: "e" for c in cols}
-        anchors.update({"wav": "w", "start": "center", "end": "center", "snore_count": "e", "snore_seconds": "e"})
+        anchors.update({"wav": "w", "start": "center", "end": "center"})
         self._set_tree_columns(cols, headings, widths=widths, anchors=anchors)
         self._clear_tree()
         self._set_status(f"Scanning WAVs under {day_prefix} …")
@@ -1902,16 +2002,18 @@ class App(tk.Tk):
 
                     # Snore score + event detection
                     try:
-                        t_sn, sn_score, sn_rel = self._snore_score_series(x, sr, frame_s=0.20, hop_s=0.10)
+                        t_sn, sn_score, sn_rel, audio_rms = self._snore_score_series(x, sr, frame_s=0.20, hop_s=0.10)
                         events = self._detect_snore_events(
                             t_sn,
                             sn_score,
                             sn_rel,
                             hop_s=0.10,
-                            k_mad=1.5,
-                            rel_floor_db=-25.0,
-                            min_len_s=0.30,
-                            max_gap_s=0.30,
+                            k_mad=3.0,
+                            rel_floor_db=-30.0,
+                            min_len_s=0.50,
+                            max_gap_s=2.0,
+                            rms_floor=5e-4,
+                            signal_rms=audio_rms,
                         )
                         snore_seconds = float(sum((b - a) for (a, b) in events))
                         snore_count = int(len(events))
@@ -1919,6 +2021,16 @@ class App(tk.Tk):
                         t_sn, sn_score, events = ([], np.zeros((0,), dtype=np.float32), [])
                         snore_seconds = 0.0
                         snore_count = 0
+
+                    # Apnea candidate detection
+                    try:
+                        apnea_events = self._detect_apnea_events(x, sr)
+                        apnea_seconds = float(sum((b - a) for (a, b) in apnea_events))
+                        apnea_count = int(len(apnea_events))
+                    except Exception:
+                        apnea_events = []
+                        apnea_seconds = 0.0
+                        apnea_count = 0
 
                     total_snore_s += snore_seconds
                     total_snore_n += snore_count
@@ -1933,6 +2045,8 @@ class App(tk.Tk):
                         f"{power_db:.1f}",
                         f"{snore_count:d}",
                         f"{snore_seconds:.1f}",
+                        f"{apnea_count:d}",
+                        f"{apnea_seconds:.1f}",
                     ))
 
                     plot_items.append({
@@ -1947,6 +2061,9 @@ class App(tk.Tk):
                         "snore_events": events,
                         "snore_count": f"{snore_count:d}",
                         "snore_seconds": f"{snore_seconds:.1f}",
+                        "apnea_events": apnea_events,
+                        "apnea_count": f"{apnea_count:d}",
+                        "apnea_seconds": f"{apnea_seconds:.1f}",
                     })
 
                 def ui_update():
@@ -1954,7 +2071,8 @@ class App(tk.Tk):
                         self.tree.insert("", tk.END, values=r)
                     self._set_status(
                         f"Sound Analyze done: {len(rows)} wav(s), total {total_dur/60.0:.1f} min; "
-                        f"snore {total_snore_n} events / {total_snore_s/60.0:.1f} min."
+                        f"snore {total_snore_n} events / {total_snore_s/60.0:.1f} min; "
+                        f"apnea {sum(int(r[9]) for r in rows)} events."
                     )
                     try:
                         self._open_sound_plot_window(plot_items)
@@ -2333,10 +2451,15 @@ class S3TaggerWindow:
         self.video_total = 0
         self.video_loaded = False
         self.preview_image = None
+        # how far into the audio/video file the first radar frame falls
+        self.audio_start_offset_sec = 0.0
+        self.video_start_offset_sec = 0.0
 
         # animation
         self.current_frame = 0
         self.animation_running = False
+        self._play_wall_t0 = None   # monotonic time when play started
+        self._play_frame_start = 0  # radar frame index when play started
 
         # tagging state
         self.actions = TAG_ACTIONS_DEFAULT.copy()
@@ -2520,12 +2643,21 @@ class S3TaggerWindow:
         self.est_hr_bpm = None
         self.radar_hr_t = None   # sliding-window HR time axis (epoch_s, for E4 comparison)
         self.radar_hr_bpm = None  # sliding-window HR estimates (bpm)
+        self.radar_rr_t = None   # sliding-window RR time axis (epoch_s)
+        self.radar_rr_bpm = None  # sliding-window RR estimates (bpm)
+        self.radar_apnea_segs = None  # list of (abs_t_start, abs_t_end) apnea segments
+        self._e4_series = None   # stored E4 data dict for overlays
         self.phase_bin_m = None
         self.phase_bin_idx = None
         self.canvas = None
         self.e4_canvas = None
         self.e4_fig = None
         self.e4_axes = None
+        self.radar_analysis_fig = None
+        self.radar_analysis_canvas = None
+        self.ax_rr = None
+        self.ax_apnea = None
+        self._radar_analysis_cursor_lines = []
         if plt is None or FigureCanvasTkAgg is None:
             tk.Label(left, text="matplotlib not available; install matplotlib to see plots.", fg="red").pack()
         else:
@@ -2544,6 +2676,14 @@ class S3TaggerWindow:
 
             self.canvas = FigureCanvasTkAgg(self.fig, master=left)
             self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+            # ---- Radar analysis figure: RR comparison + RR-filtered phase/apnea ----
+            self.radar_analysis_fig = plt.Figure(figsize=(7.0, 6.0), dpi=100)
+            self.ax_rr = self.radar_analysis_fig.add_subplot(211)
+            self.ax_apnea = self.radar_analysis_fig.add_subplot(212)
+            self.radar_analysis_fig.subplots_adjust(hspace=0.55, left=0.10, right=0.97, top=0.94, bottom=0.10)
+            self.radar_analysis_canvas = FigureCanvasTkAgg(self.radar_analysis_fig, master=left)
+            self.radar_analysis_canvas.get_tk_widget().pack(fill="both", expand=True)
 
             # ---- E4 (Empatica) plots (loaded by mapping radar HHMMSS -> closest *_physical HHMMSS) ----
             self.e4_fig = plt.Figure(figsize=(7.0, 7.0), dpi=100)
@@ -2700,13 +2840,18 @@ class S3TaggerWindow:
         wav_key = f"{base_key_dir}/{stem}.wav"
         # Tag file (TXT): action|radar: [(start,end), ...]
         txt_key = f"{base_key_dir}/{stem}.txt"
+        # Timing metadata (old format: _meta.json; new format: _audio_meta.json)
+        meta_key       = f"{base_key_dir}/{stem}_meta.json"
+        audio_meta_key = f"{base_key_dir}/{stem}_audio_meta.json"
 
         # local paths
         sess_dir = self.cache_root / stem
-        csv_path = sess_dir / f"{stem}.csv"
-        mp4_path = sess_dir / f"{stem}.mp4"
-        wav_path = sess_dir / f"{stem}.wav"
-        txt_path = sess_dir / f"{stem}.txt"
+        csv_path        = sess_dir / f"{stem}.csv"
+        mp4_path        = sess_dir / f"{stem}.mp4"
+        wav_path        = sess_dir / f"{stem}.wav"
+        txt_path        = sess_dir / f"{stem}.txt"
+        meta_path       = sess_dir / f"{stem}_meta.json"
+        audio_meta_path = sess_dir / f"{stem}_audio_meta.json"
         sess_dir.mkdir(parents=True, exist_ok=True)
 
         self._set_info("Downloading session assets…")
@@ -2731,6 +2876,17 @@ class S3TaggerWindow:
                     # ok: no existing tags yet
                     if txt_path.exists():
                         txt_path.unlink(missing_ok=True)
+                # timing metadata (best-effort; ok if absent)
+                try:
+                    _s3_download_to_file(self.s3, self.bucket, meta_key, meta_path)
+                except Exception:
+                    if meta_path.exists():
+                        meta_path.unlink(missing_ok=True)
+                try:
+                    _s3_download_to_file(self.s3, self.bucket, audio_meta_key, audio_meta_path)
+                except Exception:
+                    if audio_meta_path.exists():
+                        audio_meta_path.unlink(missing_ok=True)
 
                 def ui_update():
                     self._load_local_session(
@@ -2739,6 +2895,8 @@ class S3TaggerWindow:
                         mp4_path if mp4_path.exists() else None,
                         wav_path if wav_path.exists() else None,
                         txt_path if txt_path.exists() else None,
+                        meta_path if meta_path.exists() else None,
+                        audio_meta_path if audio_meta_path.exists() else None,
                     )
                     self._set_info("Loaded.")
 
@@ -2756,6 +2914,8 @@ class S3TaggerWindow:
             mp4_path: Path | None,
             wav_path: Path | None,
             txt_path: Path | None,
+            meta_path: Path | None = None,
+            audio_meta_path: Path | None = None,
     ):
         if pd is None:
             messagebox.showerror("Missing dependency", "pandas is required for tagging window. pip install pandas")
@@ -2781,6 +2941,40 @@ class S3TaggerWindow:
         self.window_size_var.set(str(self.window_size))
         self.timestamps = self.df["timestamp"].astype(float).to_numpy()
         self.ts0 = float(self.timestamps[0]) if self.N > 0 else 0.0
+
+        # Parse audio/video start offsets from metadata files.
+        # audio_start_offset_sec: how far into the audio file the first radar frame falls.
+        # video_start_offset_sec: same for video. Both are 0.0 if metadata unavailable.
+        self.audio_start_offset_sec = 0.0
+        self.video_start_offset_sec = 0.0
+        t_first_radar = self.ts0
+        try:
+            import json as _json
+            t_audio_wall = None
+            t_video_wall = None
+            # Old format: {stem}_meta.json has t_audio_start / t_video_start
+            if meta_path is not None and meta_path.exists():
+                with open(meta_path, encoding="utf-8") as _f:
+                    _m = _json.load(_f)
+                if "t_audio_start" in _m:
+                    t_audio_wall = float(_m["t_audio_start"])
+                if "t_video_start" in _m:
+                    t_video_wall = float(_m["t_video_start"])
+            # New format: {stem}_audio_meta.json has start_wall_time_unix_ns
+            if t_audio_wall is None and audio_meta_path is not None and audio_meta_path.exists():
+                with open(audio_meta_path, encoding="utf-8") as _f:
+                    _am = _json.load(_f)
+                if "start_wall_time_unix_ns" in _am:
+                    t_audio_wall = float(_am["start_wall_time_unix_ns"]) / 1e9
+            if t_audio_wall is not None:
+                self.audio_start_offset_sec = max(0.0, t_first_radar - t_audio_wall)
+            if t_video_wall is not None:
+                self.video_start_offset_sec = max(0.0, t_first_radar - t_video_wall)
+            elif t_audio_wall is not None:
+                # video and audio typically start together; reuse audio offset as fallback
+                self.video_start_offset_sec = self.audio_start_offset_sec
+        except Exception:
+            pass
 
         # update scrubber range
         if getattr(self, "frame_scale", None) is not None:
@@ -2832,6 +3026,9 @@ class S3TaggerWindow:
             self.est_hr_bpm = None
             self.radar_hr_t = None
             self.radar_hr_bpm = None
+            self.radar_rr_t = None
+            self.radar_rr_bpm = None
+            self.radar_apnea_segs = None
             self.phase_bin_m = None
             self.phase_bin_idx = None
 
@@ -2892,6 +3089,9 @@ class S3TaggerWindow:
         self.current_frame = 0
         self._update_view(0)
         self.display_tagged_ranges()
+
+        # Clear stale E4 overlay data before loading the new session's E4 file.
+        self._e4_series = None
 
         # Load mapped E4 (Empatica) physical session (closest HHMMSS) and update plots
         self._load_e4_for_radar_session_async(stem)
@@ -2956,8 +3156,14 @@ class S3TaggerWindow:
                     # Ignore if user already switched sessions
                     if self._current_physical_stem != phys_stem:
                         return
+                    self._e4_series = series  # store for HR/RR overlay in radar panels
                     msg = f"E4 mapped: {phys_stem} (|Δt|≈{dt_s}s)" if dt_s is not None else f"E4 mapped: {phys_stem}"
                     self._plot_e4_series(series, title_prefix=msg, skip_first_s=10.0, cursor_ts=float(self.timestamps[self.current_frame]) if getattr(self, 'timestamps', None) is not None and getattr(self, 'current_frame', None) is not None and 0 <= int(self.current_frame) < len(self.timestamps) else None)
+                    # Refresh radar panels now that E4 data is available.
+                    try:
+                        self._plot_phase_panel()
+                    except Exception:
+                        pass
 
                 self.parent.after(0, ui_update)
 
@@ -3244,7 +3450,8 @@ class S3TaggerWindow:
         if self.N <= 0 or frame_idx < 0 or frame_idx >= self.N:
             return
         t = float(self.timestamps[frame_idx] - self.timestamps[0])
-        self.audio_offset_sec = max(0.0, t)
+        # Add start offset: audio recording began before radar frame 0
+        self.audio_offset_sec = max(0.0, t + getattr(self, "audio_start_offset_sec", 0.0))
         if self.animation_running:
             self._audio_play_from(self.audio_offset_sec)
 
@@ -3254,9 +3461,12 @@ class S3TaggerWindow:
 
         # Start/resume from the current frame's timestamp (seconds since session start)
         t0 = float(self.timestamps[self.current_frame] - self.timestamps[0]) if self.current_frame < self.N else 0.0
-        self.audio_offset_sec = max(0.0, t0)
+        # Add start offset: audio recording began before radar frame 0
+        self.audio_offset_sec = max(0.0, t0 + getattr(self, "audio_start_offset_sec", 0.0))
 
         self.animation_running = True
+        self._play_wall_t0 = time.monotonic()
+        self._play_frame_start = self.current_frame
         self._audio_play_from(self.audio_offset_sec)
 
         self._animate_step()
@@ -3280,15 +3490,35 @@ class S3TaggerWindow:
 
         self.current_frame += 1
 
-        # pacing: use video fps if available; else derive from timestamps
-        delay_ms = 200
-        if self.video_loaded and self.video_fps > 0:
-            delay_ms = int(1000.0 / self.video_fps)
-        elif self.N >= 2:
-            dt = float(
-                self.timestamps[min(self.current_frame, self.N - 1)] - self.timestamps[max(self.current_frame - 1, 0)])
-            if dt > 0:
-                delay_ms = max(1, int(1000.0 * dt))
+        # Wall-clock correcting scheduler: compute when the next frame is due based
+        # on actual elapsed time since play started, then schedule only the remaining gap.
+        # This self-corrects for any latency accumulated in _update_view or Tkinter's
+        # event loop so audio and video stay in sync throughout the session.
+        now_mono = time.monotonic()
+        play_t0 = getattr(self, "_play_wall_t0", None)
+        if play_t0 is not None and self.N >= 2:
+            # Nominal frame interval from radar timestamps
+            frame_interval_s = float(
+                self.timestamps[min(self.current_frame, self.N - 1)]
+                - self.timestamps[max(self.current_frame - 1, 0)]
+            )
+            if frame_interval_s <= 0:
+                frame_interval_s = 0.2
+            frames_since_start = self.current_frame - getattr(self, "_play_frame_start", 0)
+            next_due_mono = play_t0 + frames_since_start * frame_interval_s
+            remaining_s = next_due_mono - now_mono
+            delay_ms = max(1, int(remaining_s * 1000))
+        else:
+            # Fallback: fixed interval from fps or timestamps
+            delay_ms = 200
+            if self.video_loaded and self.video_fps > 0:
+                delay_ms = int(1000.0 / self.video_fps)
+            elif self.N >= 2:
+                dt = float(
+                    self.timestamps[min(self.current_frame, self.N - 1)]
+                    - self.timestamps[max(self.current_frame - 1, 0)])
+                if dt > 0:
+                    delay_ms = max(1, int(1000.0 * dt))
         self.win.after(delay_ms, self._animate_step)
 
 
@@ -3434,8 +3664,19 @@ class S3TaggerWindow:
         # Plot sliding-window HR time series (epoch_s x-axis matches E4 HR panel).
         mask = np.isfinite(radar_hr_bpm)
         (self.phase_line,) = self.ax1.plot(
-            radar_hr_t[mask], radar_hr_bpm[mask], label="Radar HR (30 s window)"
+            radar_hr_t[mask], radar_hr_bpm[mask], label="Radar HR (30 s window)", color="steelblue"
         )
+
+        # Overlay E4 HR for direct comparison.
+        e4_series = getattr(self, "_e4_series", None)
+        if e4_series is not None and "hr" in e4_series:
+            e4_hr_t, e4_hr_bpm = e4_series["hr"]
+            e4_mask = np.isfinite(e4_hr_bpm) & np.isfinite(e4_hr_t)
+            if np.any(e4_mask):
+                self.ax1.plot(
+                    e4_hr_t[e4_mask], e4_hr_bpm[e4_mask],
+                    label="E4 HR", color="darkorange", linestyle="--", alpha=0.85,
+                )
 
         # Vertical cursor synced to the current frame (epoch_s).
         try:
@@ -3480,6 +3721,111 @@ class S3TaggerWindow:
             self.canvas.draw()
         except Exception:
             pass
+
+        # Refresh the separate radar analysis panels (RR comparison + apnea).
+        try:
+            self._plot_radar_analysis_panel()
+        except Exception:
+            pass
+
+    def _plot_radar_analysis_panel(self):
+        """Plot RR comparison (Radar vs E4) and RR-filtered phase with apnea shading."""
+        if self.ax_rr is None or self.ax_apnea is None or self.radar_analysis_canvas is None:
+            return
+
+        self._radar_analysis_cursor_lines = []
+
+        # ── Subplot 1: RR comparison (Radar vs E4) ──────────────────────────
+        self.ax_rr.cla()
+        radar_rr_t = getattr(self, "radar_rr_t", None)
+        radar_rr_bpm = getattr(self, "radar_rr_bpm", None)
+        e4_series = getattr(self, "_e4_series", None)
+
+        if radar_rr_t is not None and radar_rr_bpm is not None and len(radar_rr_t) >= 2:
+            mask = np.isfinite(radar_rr_bpm)
+            self.ax_rr.plot(
+                radar_rr_t[mask], radar_rr_bpm[mask],
+                label="Radar RR (60 s window)", color="steelblue",
+            )
+
+        if e4_series is not None and "rr" in e4_series:
+            e4_rr_t, e4_rr_bpm = e4_series["rr"]
+            e4_mask = np.isfinite(e4_rr_bpm) & np.isfinite(e4_rr_t)
+            if np.any(e4_mask):
+                self.ax_rr.plot(
+                    e4_rr_t[e4_mask], e4_rr_bpm[e4_mask],
+                    label="E4 RR", color="darkorange", linestyle="--", alpha=0.85,
+                )
+
+        # Cursor for RR panel
+        try:
+            _i = int(max(0, min(int(getattr(self, "current_frame", 0)), len(self.timestamps) - 1)))
+            cur_t = float(self.timestamps[_i])
+            ln = self.ax_rr.axvline(cur_t, linestyle="--", linewidth=1.0, color="gray", alpha=0.7)
+            self._radar_analysis_cursor_lines.append(ln)
+        except Exception:
+            pass
+
+        self.ax_rr.set_title("RR comparison — Radar (60 s window) vs E4")
+        self.ax_rr.set_ylabel("RR (brpm)")
+        try:
+            self.ax_rr.legend(loc="upper right", fontsize=8)
+        except Exception:
+            pass
+        self.ax_rr.grid(True)
+
+        # ── Subplot 2: RR-filtered phase + apnea shading ────────────────────
+        self.ax_apnea.cla()
+        phase_resp = getattr(self, "phase_resp", None)
+        phase_t_rel = getattr(self, "phase_t", None)
+        timestamps = getattr(self, "timestamps", None)
+
+        if phase_resp is not None and phase_t_rel is not None and timestamps is not None:
+            t_abs = phase_t_rel.astype(np.float64) + float(timestamps[0])
+            self.ax_apnea.plot(t_abs, phase_resp, color="teal", linewidth=0.8,
+                               label="RR-filtered phase")
+
+            apnea_segs = getattr(self, "radar_apnea_segs", None) or []
+            for i, (s, e) in enumerate(apnea_segs):
+                self.ax_apnea.axvspan(
+                    s, e, color="red", alpha=0.25,
+                    label="Apnea candidate" if i == 0 else None,
+                )
+
+            n_ap = len(apnea_segs)
+            self.ax_apnea.set_title(
+                "RR-filtered phase + apnea candidates"
+                + (f" ({n_ap} event{'s' if n_ap != 1 else ''})" if n_ap > 0 else " (none detected)")
+            )
+
+            # Cursor for apnea panel
+            try:
+                _i = int(max(0, min(int(getattr(self, "current_frame", 0)), len(timestamps) - 1)))
+                cur_t = float(timestamps[_i])
+                ln = self.ax_apnea.axvline(cur_t, linestyle="--", linewidth=1.0, color="gray", alpha=0.7)
+                self._radar_analysis_cursor_lines.append(ln)
+            except Exception:
+                pass
+
+            try:
+                self.ax_apnea.legend(loc="upper right", fontsize=8)
+            except Exception:
+                pass
+        else:
+            self.ax_apnea.set_title("RR-filtered phase (not available)")
+
+        self.ax_apnea.set_xlabel("epoch_s (aligned with E4)")
+        self.ax_apnea.set_ylabel("Phase (rad)")
+        self.ax_apnea.grid(True)
+
+        try:
+            self.radar_analysis_canvas.draw_idle()
+        except Exception:
+            try:
+                self.radar_analysis_canvas.draw()
+            except Exception:
+                pass
+
     def _update_phase_cursor(self, idx: int):
         """Update (or create) the vertical cursor line on the phase plot (ax1)."""
         if self.ax1 is None or self.canvas is None:
@@ -3518,6 +3864,18 @@ class S3TaggerWindow:
             except Exception:
                 pass
 
+        # Also update radar analysis panel cursors (RR + apnea).
+        try:
+            ra_lines = getattr(self, "_radar_analysis_cursor_lines", None)
+            if ra_lines and self.radar_analysis_canvas is not None:
+                for ln in ra_lines:
+                    try:
+                        ln.set_xdata([cur_t, cur_t])
+                    except Exception:
+                        pass
+                self.radar_analysis_canvas.draw_idle()
+        except Exception:
+            pass
 
 
     def _update_e4_cursor(self, idx: int) -> None:
@@ -3538,6 +3896,21 @@ class S3TaggerWindow:
                 except Exception:
                     pass
             self.e4_canvas.draw_idle()
+        except Exception:
+            pass
+
+        # Also update radar analysis panel cursors (RR + apnea).
+        try:
+            ra_lines = getattr(self, "_radar_analysis_cursor_lines", None)
+            if ra_lines and self.radar_analysis_canvas is not None:
+                i2 = int(max(0, min(int(idx), len(self.timestamps) - 1)))
+                ct = float(self.timestamps[i2])
+                for ln in ra_lines:
+                    try:
+                        ln.set_xdata([ct, ct])
+                    except Exception:
+                        pass
+                self.radar_analysis_canvas.draw_idle()
         except Exception:
             pass
 
@@ -3625,6 +3998,9 @@ class S3TaggerWindow:
         self.est_hr_bpm = None
         self.radar_hr_t = None
         self.radar_hr_bpm = None
+        self.radar_rr_t = None
+        self.radar_rr_bpm = None
+        self.radar_apnea_segs = None
         self.phase_bin_m = None
 
         if self.df is None or self.timestamps is None or self.range_axis is None or self.N <= 3:
@@ -3732,6 +4108,65 @@ class S3TaggerWindow:
                 hr_bpm_list.append(np.nan if bpm is None else float(bpm))
             self.radar_hr_t = np.array(hr_t_list, dtype=np.float64)
             self.radar_hr_bpm = np.array(hr_bpm_list, dtype=np.float64)
+
+        # Sliding-window RR time series (60 s window, 5 s step) for comparison with E4 RR.
+        win_rr_s = 60.0
+        step_rr_s = 5.0
+        n_win_rr = int(win_rr_s * fs)
+        n_step_rr = max(1, int(step_rr_s * fs))
+        if n_win_rr >= 8 and len(ph_d) >= n_win_rr:
+            t_abs_start = float(self.timestamps[0])
+            rr_t_list: list[float] = []
+            rr_bpm_list: list[float] = []
+            for end in range(n_win_rr, len(ph_d) + 1, n_step_rr):
+                seg = ph_d[end - n_win_rr : end]
+                bpm = self._estimate_peak_bpm(seg, fs_hz=fs, f_lo=0.10, f_hi=0.60)
+                rr_t_list.append(t_abs_start + float(t[end - 1]))
+                rr_bpm_list.append(np.nan if bpm is None else float(bpm))
+            self.radar_rr_t = np.array(rr_t_list, dtype=np.float64)
+            self.radar_rr_bpm = np.array(rr_bpm_list, dtype=np.float64)
+
+        # Apnea detection: sliding RMS envelope of RR-filtered phase; flag windows below 30% of baseline.
+        # Uses 10 s window, 0.5 s step (same parameters as standalone apnea_analysis.py).
+        if self.phase_resp is not None and len(self.phase_resp) > 0:
+            WIN_AP_S = 10.0
+            STEP_AP_S = 0.5
+            APNEA_PCT = 0.30
+            GAP_MERGE_S = 3.0
+            MIN_APNEA_S = 3.0
+            n_win_ap = int(WIN_AP_S * fs)
+            n_step_ap = max(1, int(STEP_AP_S * fs))
+            if n_win_ap >= 8 and len(self.phase_resp) >= n_win_ap:
+                t_abs_start = float(self.timestamps[0])
+                amps_ap: list[float] = []
+                t_ap_list: list[float] = []
+                for end in range(n_win_ap, len(self.phase_resp) + 1, n_step_ap):
+                    seg = self.phase_resp[end - n_win_ap : end].astype(np.float64)
+                    amps_ap.append(float(np.sqrt(np.mean(seg ** 2))))
+                    t_ap_list.append(t_abs_start + float(t[end - n_win_ap // 2]))
+                amps_arr = np.array(amps_ap)
+                t_arr = np.array(t_ap_list)
+                if amps_arr.size > 0 and amps_arr.max() > 0:
+                    baseline_ap = float(np.median(amps_arr[amps_arr >= np.percentile(amps_arr, 50)]))
+                    threshold_ap = APNEA_PCT * baseline_ap
+                    apnea_mask = amps_arr < threshold_ap
+                    apnea_segs: list[tuple[float, float]] = []
+                    in_ap = False
+                    seg_s = 0.0
+                    for i, flag in enumerate(apnea_mask):
+                        if flag and not in_ap:
+                            seg_s = t_arr[i]
+                            in_ap = True
+                        elif not flag and in_ap:
+                            seg_e = t_arr[i - 1]
+                            if apnea_segs and (seg_s - apnea_segs[-1][1]) < GAP_MERGE_S:
+                                apnea_segs[-1] = (apnea_segs[-1][0], seg_e)
+                            else:
+                                apnea_segs.append((seg_s, seg_e))
+                            in_ap = False
+                    if in_ap:
+                        apnea_segs.append((seg_s, t_arr[-1]))
+                    self.radar_apnea_segs = [(s, e) for s, e in apnea_segs if (e - s) >= MIN_APNEA_S]
 
 
     # ---------- View update ----------
@@ -3872,7 +4307,9 @@ class S3TaggerWindow:
 
         # video
         if self.video_loaded and self.video_cap is not None and cv2 is not None and Image is not None and ImageTk is not None:
-            t = float(self.timestamps[idx] - self.ts0) if self.timestamps is not None else 0.0
+            t_radar = float(self.timestamps[idx] - self.ts0) if self.timestamps is not None else 0.0
+            # Add video start offset: video recording began before radar frame 0
+            t = t_radar + getattr(self, "video_start_offset_sec", 0.0)
             v_idx = 0
             if self.video_fps > 0:
                 v_idx = int(round(t * self.video_fps))

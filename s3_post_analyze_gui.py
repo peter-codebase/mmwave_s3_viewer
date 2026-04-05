@@ -38,7 +38,7 @@ import tkinter as tk
 # Local helper for consistent S3 key layout
 from s3_layout import S3Layout
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -189,8 +189,8 @@ def _read_wav_as_pcm16_bytes(wav_path: Path):
             x = (x / peak) * 0.95  # auto-normalize to 95% full scale
         x = np.clip(x, -1.0, 1.0)
         x16 = (x * 32767.0).astype("<i2")
-        # (x already normalized, but keep consistent)
-        x16 = _auto_normalize_int16(x16)
+        # x is already normalized above; calling _auto_normalize_int16 again would
+        # re-scale to 95% of 95%, compounding the attenuation — skip it here.
         return int(ch), 2, int(sr), x16.tobytes()
 
     raise ValueError(f"Unsupported WAV format tag={audio_format}, bits={bps}")
@@ -485,7 +485,7 @@ def estimate_latency_beep_to_speech(x: np.ndarray, sr: int) -> tuple[float | Non
     Returns: (latency_s, beep_end_s, speech_onset_s, notes)
     """
     if sr <= 0 or x.size == 0:
-        return None, None, None, "empty_audio"
+        return None, None, None, "empty_audio", False
 
     x = np.clip(x.astype(np.float32), -1.0, 1.0)
 
@@ -529,6 +529,7 @@ def estimate_latency_beep_to_speech(x: np.ndarray, sr: int) -> tuple[float | Non
 
     # If still not found, fall back to treating start of WAV as time-zero (no beep reference).
     # This matches your request: assume beginning of the wav as the "prompt end" and find speech via VAD/RMS/flux.
+    beep_found = (beep_conf == 1)  # True only when a real beep was detected
     if beep_conf == 0:
         beep_end_s = 0.0
         beep_note = "beep_missing_use_wav_start"
@@ -544,6 +545,15 @@ def estimate_latency_beep_to_speech(x: np.ndarray, sr: int) -> tuple[float | Non
     )
 
     if speech_conf == 0:
+        # Adaptive abs_floor: scale with the actual peak amplitude in the post-beep window.
+        # A global constant of 1.5e-4 is too high for Parkinson's / hypophonic speakers whose
+        # voice may be very quiet on the recording. Using 0.5% of the local peak ensures the
+        # floor drops proportionally for quiet recordings while remaining above noise for loud ones.
+        start_i = int(max(0, round(float(beep_end_s) * sr2)))
+        x_post = x2[start_i:] if start_i < x2.size else x2
+        peak_amp = float(np.max(np.abs(x_post))) if x_post.size > 0 else 1.5e-4
+        adaptive_floor = max(1e-5, peak_amp * 0.005)
+
         onset_s, speech_conf, speech_note = _detect_speech_onset_rms(
             x2, sr2,
             start_s=float(beep_end_s),
@@ -552,7 +562,7 @@ def estimate_latency_beep_to_speech(x: np.ndarray, sr: int) -> tuple[float | Non
             noise_est_s=0.6,
             consec=3,
             snr_mult=2.2,
-            abs_floor=1.5e-4,
+            abs_floor=adaptive_floor,
         )
 
     if speech_conf == 0:
@@ -580,10 +590,11 @@ def estimate_latency_beep_to_speech(x: np.ndarray, sr: int) -> tuple[float | Non
                 notes = ";".join([res_note, beep_note, auto_note, speech_note])
 
     if speech_conf == 0:
-        return None, float(beep_end_s), None, notes
+        return None, float(beep_end_s), None, notes, False
 
     latency_s = float(onset_s - float(beep_end_s))
-    return float(max(0.0, latency_s)), float(beep_end_s), float(onset_s), notes
+    # latency_valid: only True when an actual beep was found; wav-start fallback is not comparable
+    return float(max(0.0, latency_s)), float(beep_end_s), float(onset_s), notes, beep_found
 
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -823,11 +834,10 @@ def _read_wav_mono_float32(wav_bytes: bytes) -> tuple[int, np.ndarray]:
     if sampwidth == 2:
         x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     elif sampwidth == 4:
-        x_i32 = np.frombuffer(raw, dtype=np.int32).astype(np.float32)
-        if np.max(np.abs(x_i32)) > 1.5:
-            x = x_i32 / 2147483648.0
-        else:
-            x = np.frombuffer(raw, dtype=np.float32).astype(np.float32)
+        # Python's wave module only accepts PCM (format tag 1). IEEE float WAVs
+        # (format tag 3) raise an exception in wave.open() and never reach this branch.
+        # So sampwidth==4 here unambiguously means signed 32-bit PCM — no heuristic needed.
+        x = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
     elif sampwidth == 1:
         x = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
     else:
@@ -836,6 +846,309 @@ def _read_wav_mono_float32(wav_bytes: bytes) -> tuple[int, np.ndarray]:
     if nchan > 1:
         x = x.reshape(-1, nchan).mean(axis=1)
     return int(sr), x.astype(np.float32)
+
+
+# ---------------- Voice quality biomarker analyser ----------------
+
+def _analyse_voice_quality(
+    x: np.ndarray,
+    sr: int,
+    beep_end_s: float | None = None,
+) -> dict:
+    """Compute per-clip voice quality biomarkers from a mono float32 signal.
+
+    Uses only numpy — no librosa / praat dependency.
+
+    Returns a dict with keys:
+        f0_mean_hz    – median F0 of voiced frames (Hz); None if no voiced frames
+        f0_range_hz   – P95-P5 range of voiced F0 (Hz); None if < 5 voiced frames
+        jitter_pct    – mean |ΔT| / mean_T × 100 (%); None if < 2 voiced frames
+        shimmer_pct   – mean |ΔA| / mean_A × 100 (%); None if < 2 voiced frames
+        hnr_db        – median HNR across voiced frames (dB); None if no voiced frames
+        voiced_ratio  – fraction of voiced frames [0, 1]
+    """
+    _FRAME_MS = 20.0
+    _HOP_MS   = 10.0
+    _TARGET_SR = 16000
+    _F0_LO_HZ  = 75.0
+    _F0_HI_HZ  = 500.0
+    _VOICED_TH  = 0.45   # unbiased-ACF threshold; 0.45 ≈ HNR > 2 dB
+
+    if x is None or x.size == 0 or sr <= 0:
+        return dict(f0_mean_hz=None, f0_range_hz=None, jitter_pct=None,
+                    shimmer_pct=None, hnr_db=None, voiced_ratio=0.0)
+
+    # --- Trim to post-beep region ---
+    start_idx = 0
+    if beep_end_s is not None and beep_end_s > 0.0:
+        start_idx = int(round(beep_end_s * sr))
+    x_speech = x[start_idx:] if start_idx < x.size else x
+
+    if x_speech.size == 0:
+        return dict(f0_mean_hz=None, f0_range_hz=None, jitter_pct=None,
+                    shimmer_pct=None, hnr_db=None, voiced_ratio=0.0)
+
+    # --- Anti-aliased resampling toward 16 kHz (FFT-based, no scipy needed) ---
+    if sr != _TARGET_SR:
+        old_len = x_speech.size
+        new_len = max(1, int(round(old_len * _TARGET_SR / sr)))
+        # Resample in frequency domain: zero-pad or truncate the rfft spectrum.
+        # This is equivalent to ideal sinc interpolation with a brick-wall
+        # anti-aliasing filter at min(sr, _TARGET_SR)/2 — avoids aliasing
+        # from the linear-interpolation approach.
+        X = np.fft.rfft(x_speech.astype(np.float64))
+        X_new = np.zeros(new_len // 2 + 1, dtype=np.complex128)
+        n_copy = min(X.size, X_new.size)
+        X_new[:n_copy] = X[:n_copy]
+        x_speech = np.fft.irfft(X_new, n=new_len).astype(np.float32)
+        # Preserve amplitude
+        x_speech *= float(new_len) / float(old_len)
+        sr_use = _TARGET_SR
+    else:
+        sr_use = sr
+
+    frame_len = int(round(_FRAME_MS * 1e-3 * sr_use))
+    hop_len   = int(round(_HOP_MS   * 1e-3 * sr_use))
+    if frame_len < 4 or x_speech.size < frame_len:
+        return dict(f0_mean_hz=None, f0_range_hz=None, jitter_pct=None,
+                    shimmer_pct=None, hnr_db=None, voiced_ratio=0.0)
+
+    # Autocorrelation lag range for F0 search
+    lag_lo = max(1, int(sr_use / _F0_HI_HZ))
+    lag_hi = min(frame_len - 1, int(sr_use / _F0_LO_HZ))
+    if lag_lo >= lag_hi:
+        return dict(f0_mean_hz=None, f0_range_hz=None, jitter_pct=None,
+                    shimmer_pct=None, hnr_db=None, voiced_ratio=0.0)
+
+    # Precompute divisors for unbiased ACF: divide lag k by (N - k)
+    k_arr = np.arange(frame_len, dtype=np.float64)
+    unbiased_div = np.maximum(frame_len - k_arr, 1.0)
+
+    f0_frames: list[float] = []
+    amp_frames: list[float] = []    # RMS amplitude per voiced frame
+    hnr_frames: list[float] = []
+    voiced_count = 0
+    total_count  = 0
+
+    n_fft = 1 << int(np.ceil(np.log2(2 * frame_len - 1)))
+
+    n_starts = max(1, (x_speech.size - frame_len) // hop_len + 1)
+    for i in range(n_starts):
+        s = i * hop_len
+        frame = x_speech[s:s + frame_len]
+        if frame.size < frame_len:
+            break
+        total_count += 1
+
+        # Per-frame DC removal
+        frame_dc = frame - frame.mean()
+
+        # Unbiased normalized autocorrelation (no Hann window).
+        # Dividing each lag k by (N-k) corrects the triangular bias that
+        # the biased ACF has at large lags, giving r_norm[T0] ≈ 1.0 for a
+        # pure sine rather than ≈ (N-T0)/N, which was causing HNR to be
+        # negative and voiced frames to be missed.
+        F = np.fft.rfft(frame_dc.astype(np.float64), n=n_fft)
+        acf_raw = np.fft.irfft(F * np.conj(F))[:frame_len]
+        acf_unb = acf_raw / unbiased_div
+        r0 = float(acf_unb[0])
+        if r0 < 1e-12:
+            continue
+        r_norm = acf_unb / r0   # r_norm[0] == 1.0; r_norm[T0] ≈ 1 for pure tone
+
+        # Find peak lag in F0 search range
+        peak_lag = int(np.argmax(r_norm[lag_lo:lag_hi + 1])) + lag_lo
+        peak_val = float(r_norm[peak_lag])
+
+        if peak_val < _VOICED_TH:
+            continue   # unvoiced frame
+
+        voiced_count += 1
+        f0_frames.append(float(sr_use / peak_lag))
+        amp_frames.append(float(np.sqrt(np.mean(frame_dc ** 2))))
+
+        # HNR from unbiased r[T0]: positive for r[T0] > 0.5, typical normal
+        # speech gives 10-20 dB after this fix.
+        pv = min(peak_val, 0.9999)
+        hnr_frames.append(float(10.0 * np.log10(pv / (1.0 - pv))))
+
+    total_count = max(total_count, 1)
+    voiced_ratio = voiced_count / total_count
+
+    if not f0_frames:
+        return dict(f0_mean_hz=None, f0_range_hz=None, jitter_pct=None,
+                    shimmer_pct=None, hnr_db=None, voiced_ratio=voiced_ratio)
+
+    f0_arr  = np.array(f0_frames,  dtype=np.float64)
+    amp_arr = np.array(amp_frames, dtype=np.float64)
+
+    f0_mean  = float(np.median(f0_arr))
+    f0_range = (float(np.percentile(f0_arr, 95) - np.percentile(f0_arr, 5))
+                if len(f0_arr) >= 5 else None)
+
+    # For jitter and shimmer, discard frames whose F0 is outside one octave
+    # of the median — these are octave errors or ceiling-hits that would
+    # otherwise wildly inflate the cycle-to-cycle variation metric.
+    # Note: lower bound is 55% (not 50%) of median to prevent sub-octave
+    # aliases (e.g. 79.6 Hz when true F0 is 160 Hz) from slipping through
+    # the filter boundary and causing false jitter spikes.
+    octave_mask = (f0_arr > f0_mean * 0.55) & (f0_arr < f0_mean * 1.8)
+    f0_clean  = f0_arr[octave_mask]
+    amp_clean = amp_arr[octave_mask]
+
+    # Jitter: cycle-to-cycle period variation (sustained-vowel style)
+    if len(f0_clean) >= 2:
+        periods = sr_use / f0_clean
+        jitter_pct = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods) * 100.0)
+    else:
+        jitter_pct = None
+
+    # Shimmer: cycle-to-cycle amplitude variation
+    if len(amp_clean) >= 2 and np.mean(amp_clean) > 1e-12:
+        shimmer_pct = float(np.mean(np.abs(np.diff(amp_clean))) / np.mean(amp_clean) * 100.0)
+    else:
+        shimmer_pct = None
+
+    hnr_db = float(np.median(hnr_frames)) if hnr_frames else None
+
+    return dict(
+        f0_mean_hz  = round(f0_mean,  2),
+        f0_range_hz = (round(f0_range, 2) if f0_range is not None else None),
+        jitter_pct  = (round(jitter_pct,  3) if jitter_pct  is not None else None),
+        shimmer_pct = (round(shimmer_pct, 3) if shimmer_pct is not None else None),
+        hnr_db      = (round(hnr_db,  2)     if hnr_db      is not None else None),
+        voiced_ratio = round(voiced_ratio, 4),
+    )
+
+
+# ---------------- Voice drift record fetcher ----------------
+
+def _fetch_voice_drift_records(
+    s3, bucket: str, layout, user_id: str, dates: list,
+    existing_keys: set | None = None,
+) -> list:
+    """Download and analyse all voice_drift WAVs for the given user/dates.
+
+    Args:
+        existing_keys: S3 keys already present in a cached CSV; those WAVs are
+                       skipped so we only process new clips. Pass None to process all.
+    Returns:
+        List of record dicts ready for pd.DataFrame().
+    """
+    if existing_keys is None:
+        existing_keys = set()
+
+    records = []
+    for day in dates:
+        vd_prefix = pick_voice_drift_prefix(layout, s3, bucket, user_id, day)
+        if not vd_prefix:
+            continue
+
+        objs = list_objects(s3, bucket, vd_prefix, max_items=5000)
+        keys = [o.get("Key") for o in objs if o.get("Key")]
+        done_key = next((k for k in keys if k.lower().endswith("_done.json")), None)
+        wav_keys = sorted([k for k in keys if k.lower().endswith(".wav")])
+
+        if not wav_keys:
+            continue
+
+        time_str = "--:--:--"
+        date_str = day
+        if done_key:
+            try:
+                done = json.loads(download_text_object(s3, bucket, done_key))
+                date_str = str(done.get("day", day))
+                ts = done.get("created_at_unix")
+                if ts is not None:
+                    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                    time_str = dt.strftime("%H:%M:%S UTC")
+            except Exception:
+                pass
+
+        for k in wav_keys:
+            if k in existing_keys:
+                continue
+
+            fname = k.split("/")[-1]
+            w = s3.get_object(Bucket=bucket, Key=k)
+            wav_bytes = w["Body"].read()
+
+            sr, x = _read_wav_mono_float32(wav_bytes)
+            duration_s = float(x.size) / float(sr) if sr > 0 else 0.0
+
+            latency_s, beep_end_s, speech_onset_s, notes, latency_valid = estimate_latency_beep_to_speech(x, sr)
+
+            vq = _analyse_voice_quality(x, sr, beep_end_s=beep_end_s)
+
+            records.append({
+                "filename": fname,
+                "date": date_str,
+                "time": time_str,
+                "duration_s": float(f"{duration_s:.2f}"),
+                "latency_s": (None if latency_s is None else float(f"{latency_s:.3f}")),
+                "beep_end_s": (None if beep_end_s is None else float(f"{beep_end_s:.3f}")),
+                "speech_onset_s": (None if speech_onset_s is None else float(f"{speech_onset_s:.3f}")),
+                "latency_valid": bool(latency_valid),
+                "notes": notes,
+                "s3_key": k,
+                # --- voice quality biomarkers ---
+                "f0_mean_hz":   vq["f0_mean_hz"],
+                "f0_range_hz":  vq["f0_range_hz"],
+                "jitter_pct":   vq["jitter_pct"],
+                "shimmer_pct":  vq["shimmer_pct"],
+                "hnr_db":       vq["hnr_db"],
+                "voiced_ratio": vq["voiced_ratio"],
+            })
+
+    return records
+
+
+# ---------------- ADL Export helpers ----------------
+
+def _parse_adl_tags(txt_text: str) -> list[dict]:
+    """Parse ADL tag file content into segment dicts.
+
+    Format per line:  activity|dev0: [(start, end), ...]
+    Returns list of {"action": str, "radar": str, "start": int, "end": int}.
+    Frame indices are 1-based inclusive.
+    """
+    segs: list[dict] = []
+    for line in txt_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            left, ranges_str = line.split(":", 1)
+            left = left.strip()
+            ranges = ast.literal_eval(ranges_str.strip())
+            if isinstance(ranges, tuple):
+                ranges = [ranges]
+            if not isinstance(ranges, list):
+                ranges = [ranges]
+            radar = "both"
+            act = left
+            if "|" in left:
+                act, radar = [x.strip() for x in left.split("|", 1)]
+                radar = radar.lower()
+                if radar not in {"dev0", "dev1", "both"}:
+                    radar = "both"
+            for s, e in ranges:
+                segs.append({"action": str(act).strip(), "radar": radar,
+                             "start": int(s), "end": int(e)})
+        except Exception:
+            continue
+    return segs
+
+
+def _select_device_cols(all_cols: list[str], radar: str) -> list[str]:
+    """Return chirp data column names for the given device(s)."""
+    if radar == "dev0":
+        prefixes = ("dev0_",)
+    elif radar == "dev1":
+        prefixes = ("dev1_",)
+    else:  # both
+        prefixes = ("dev0_", "dev1_")
+    return [c for c in all_cols if any(c.startswith(p) for p in prefixes)]
 
 
 # ---------------- GUI ----------------
@@ -904,6 +1217,10 @@ class App(tk.Tk):
         )
         ttk.Button(frm_sel, text="Tag data", command=self.on_open_tagger).grid(
             row=0, column=7, padx=(10, 0), sticky="w"
+        )
+
+        ttk.Button(frm_sel, text="ADL Export", command=self.on_adl_export).grid(
+            row=1, column=0, columnspan=2, pady=(6, 0), sticky="w"
         )
 
         # Results table
@@ -1236,6 +1553,12 @@ class App(tk.Tk):
             def to_num_series(series):
                 return pd.to_numeric(series, errors="coerce")
 
+            def _col(name):
+                """Return a numeric Series for `name`, or all-NaN if column absent."""
+                if name in df.columns:
+                    return to_num_series(df[name])
+                return pd.Series([float("nan")] * len(df), index=df.index)
+
             fn = df["filename"].astype(str)
 
             def _clip_type(name: str) -> str:
@@ -1253,10 +1576,16 @@ class App(tk.Tk):
                 base = base.rsplit(".", 1)[0]
                 if not base.startswith("self_feel_"):
                     return None
-                try:
-                    return float(base[len("self_feel_"):])
-                except Exception:
-                    return None
+                # Extract the first numeric value (int or float) after the prefix.
+                # Handles filenames like self_feel_7.wav, self_feel_3.5.wav,
+                # self_feel_8_extra.wav — the strict slice float() would fail on the last form.
+                m = re.search(r"(\d+(?:\.\d+)?)", base[len("self_feel_"):])
+                if m:
+                    try:
+                        return float(m.group(1))
+                    except Exception:
+                        pass
+                return None
 
             df = df.copy()
             df["clip_type"] = [_clip_type(x) for x in fn.tolist()]
@@ -1275,59 +1604,125 @@ class App(tk.Tk):
             # Use python date objects (no timezone shift)
             x = df["date_dt"].dt.date
 
-            dur = to_num_series(df.get("duration_s"))
-            lat = to_num_series(df.get("latency_s"))
-            scores = to_num_series(df.get("self_feel_score"))
+            dur    = _col("duration_s")
+            lat    = _col("latency_s")
+            scores = _col("self_feel_score")
+            f0s    = _col("f0_mean_hz")
+            jits   = _col("jitter_pct")
+            hnrs   = _col("hnr_db")
 
             win = tk.Toplevel(self)
             win.title(f"Voice Drift — {user_id} (overall)")
-            win.geometry("1100x800")
+            win.geometry("1100x1050")
 
-            fig = plt.Figure(figsize=(10.6, 7.4), dpi=100)
+            fig = plt.Figure(figsize=(10.6, 10.0), dpi=100)
 
-            ax1 = fig.add_subplot(311)
-            ax2 = fig.add_subplot(312)
-            ax3 = fig.add_subplot(313)
+            ax1 = fig.add_subplot(321)
+            ax2 = fig.add_subplot(322)
+            ax3 = fig.add_subplot(323)
+            ax4 = fig.add_subplot(324)
+            ax5 = fig.add_subplot(325)
+            ax6 = fig.add_subplot(326)
 
             types = sorted([t for t in df["clip_type"].unique() if t])
 
-            # -------- Duration (LINE ONLY) --------
+            # -------- Duration --------
             for t in types:
                 if t == "self_feel":
                     continue
                 mask = df["clip_type"] == t
                 ax1.plot(x[mask], dur[mask], label=t)
 
-            ax1.set_title("Duration per clip (s) by type")
-            ax1.set_xlabel("Clip index")
+            ax1.set_title("Duration (s)")
             ax1.set_ylabel("Duration (s)")
             ax1.grid(True, alpha=0.3)
             ax1.legend(loc="best", fontsize=8)
 
-            # -------- Latency (LINE ONLY) --------
+            # -------- Latency --------
             for t in types:
                 if t == "self_feel":
                     continue
                 mask = df["clip_type"] == t
-                ax2.plot(x[mask], lat[mask], label=t)
+                if mask.any():
+                    ax2.plot(x[mask], lat[mask], label=t)
 
-            ax2.set_title("Latency per clip (s) by type")
-            ax2.set_xlabel("Clip index")
+            ax2.set_title("Latency (s)")
             ax2.set_ylabel("Latency (s)")
             ax2.grid(True, alpha=0.3)
             ax2.legend(loc="best", fontsize=8)
 
-            # -------- Self-feel Score (LINE ONLY) --------
+            # Beep-contamination filter: if beep_end_s detection failed the
+            # analysis window includes the beep tone, pushing f0_mean_hz to
+            # the 500 Hz ceiling.  Drop any row where f0_mean_hz > 300 Hz
+            # before plotting F0 and Jitter — mark them as hollow red circles
+            # so the user can see which sessions had bad beep detection.
+            _F0_OUTLIER_HZ = 300.0
+            f0_ok = f0s.isna() | (f0s <= _F0_OUTLIER_HZ)   # True = keep
+
+            # -------- F0 mean --------
+            for t in types:
+                if t == "self_feel":
+                    continue
+                mask_ok  = (df["clip_type"] == t) & f0_ok
+                mask_bad = (df["clip_type"] == t) & ~f0_ok
+                vals_ok  = f0s[mask_ok]
+                if vals_ok.notna().any():
+                    ax3.plot(x[mask_ok][vals_ok.notna()], vals_ok[vals_ok.notna()], label=t)
+                if mask_bad.any():
+                    ax3.scatter(x[mask_bad], f0s[mask_bad],
+                                marker="x", color="red", s=40, zorder=5)
+
+            ax3.set_title("F0 mean (Hz)  [✕ = beep-contaminated, excluded]")
+            ax3.set_ylabel("F0 (Hz)")
+            ax3.grid(True, alpha=0.3)
+            ax3.legend(loc="best", fontsize=8)
+
+            # -------- Jitter % --------
+            for t in types:
+                if t == "self_feel":
+                    continue
+                mask_ok  = (df["clip_type"] == t) & f0_ok
+                mask_bad = (df["clip_type"] == t) & ~f0_ok
+                vals_ok  = jits[mask_ok]
+                if vals_ok.notna().any():
+                    ax4.plot(x[mask_ok][vals_ok.notna()], vals_ok[vals_ok.notna()], label=t)
+                if mask_bad.any():
+                    ax4.scatter(x[mask_bad], jits[mask_bad],
+                                marker="x", color="red", s=40, zorder=5)
+
+            ax4.set_title("Jitter (%)  [✕ = beep-contaminated, excluded]")
+            ax4.set_ylabel("Jitter (%)")
+            ax4.grid(True, alpha=0.3)
+            ax4.legend(loc="best", fontsize=8)
+
+            # -------- HNR --------
+            for t in types:
+                if t == "self_feel":
+                    continue
+                mask = df["clip_type"] == t
+                vals = hnrs[mask]
+                if vals.notna().any():
+                    ax5.plot(x[mask][vals.notna()], vals[vals.notna()], label=t)
+
+            ax5.set_title("HNR (dB)")
+            ax5.set_ylabel("HNR (dB)")
+            ax5.grid(True, alpha=0.3)
+            ax5.legend(loc="best", fontsize=8)
+
+            # -------- Self-evaluation Score --------
             mask_sf = df["clip_type"] == "self_feel"
             if mask_sf.any():
-                ax3.plot(x[mask_sf], scores[mask_sf])
-                ax3.set_title("Self-feel score over time")
+                ax6.plot(x[mask_sf], scores[mask_sf])
+                ax6.set_title("Self-evaluation score")
             else:
-                ax3.set_title("Self-feel score (none found)")
+                ax6.set_title("Self-evaluation score (none found)")
 
-            ax3.set_xlabel("Clip index")
-            ax3.set_ylabel("Score")
-            ax3.grid(True, alpha=0.3)
+            ax6.set_ylabel("Score")
+            ax6.grid(True, alpha=0.3)
+
+            # Shared x-label on bottom row
+            for ax in (ax5, ax6):
+                ax.set_xlabel("Date")
 
             fig.tight_layout()
 
@@ -1355,58 +1750,10 @@ class App(tk.Tk):
                     self.after(0, lambda: self._set_status("Cached CSV found; scanning for new voice_drift wavs…"))
 
                     dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
-                    new_records = []
-
-                    for day in dates:
-                        vd_prefix = pick_voice_drift_prefix(layout, self.s3, self.bucket, user_id, day)
-                        if not vd_prefix:
-                            continue
-
-                        objs = list_objects(self.s3, self.bucket, vd_prefix, max_items=5000)
-                        keys = [o.get("Key") for o in objs if o.get("Key")]
-                        done_key = next((k for k in keys if k.lower().endswith("_done.json")), None)
-                        wav_keys = sorted([k for k in keys if k.lower().endswith(".wav")])
-
-                        if not wav_keys:
-                            continue
-
-                        time_str = "--:--:--"
-                        date_str = day
-                        if done_key:
-                            try:
-                                done = json.loads(download_text_object(self.s3, self.bucket, done_key))
-                                date_str = str(done.get("day", day))
-                                ts = done.get("created_at_unix")
-                                if ts is not None:
-                                    dt = datetime.fromtimestamp(float(ts))
-                                    time_str = dt.strftime("%H:%M:%S")
-                            except Exception:
-                                pass
-
-                        for k in wav_keys:
-                            if k in existing_keys:
-                                continue
-
-                            fname = k.split("/")[-1]
-                            w = self.s3.get_object(Bucket=self.bucket, Key=k)
-                            wav_bytes = w["Body"].read()
-
-                            sr, x = _read_wav_mono_float32(wav_bytes)
-                            duration_s = float(x.size) / float(sr) if sr > 0 else 0.0
-
-                            latency_s, beep_end_s, speech_onset_s, notes = estimate_latency_beep_to_speech(x, sr)
-
-                            new_records.append({
-                                "filename": fname,
-                                "date": date_str,
-                                "time": time_str,
-                                "duration_s": float(f"{duration_s:.2f}"),
-                                "latency_s": (None if latency_s is None else float(f"{latency_s:.3f}")),
-                                "beep_end_s": (None if beep_end_s is None else float(f"{beep_end_s:.3f}")),
-                                "speech_onset_s": (None if speech_onset_s is None else float(f"{speech_onset_s:.3f}")),
-                                "notes": notes,
-                                "s3_key": k,
-                            })
+                    new_records = _fetch_voice_drift_records(
+                        self.s3, self.bucket, layout, user_id, dates,
+                        existing_keys=existing_keys,
+                    )
 
                     if not new_records:
                         rows = _rows_from_dataframe(df_old)
@@ -1446,55 +1793,9 @@ class App(tk.Tk):
                 self.after(0, lambda: self._set_status("No cached CSV found; computing voice drift across all days…"))
 
                 dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
-                out_records = []
-
-                for day in dates:
-                    vd_prefix = pick_voice_drift_prefix(layout, self.s3, self.bucket, user_id, day)
-                    if not vd_prefix:
-                        continue
-
-                    objs = list_objects(self.s3, self.bucket, vd_prefix, max_items=5000)
-                    keys = [o.get("Key") for o in objs if o.get("Key")]
-                    done_key = next((k for k in keys if k.lower().endswith("_done.json")), None)
-                    wav_keys = sorted([k for k in keys if k.lower().endswith(".wav")])
-
-                    if not wav_keys:
-                        continue
-
-                    time_str = "--:--:--"
-                    date_str = day
-                    if done_key:
-                        try:
-                            done = json.loads(download_text_object(self.s3, self.bucket, done_key))
-                            date_str = str(done.get("day", day))
-                            ts = done.get("created_at_unix")
-                            if ts is not None:
-                                dt = datetime.fromtimestamp(float(ts))
-                                time_str = dt.strftime("%H:%M:%S")
-                        except Exception:
-                            pass
-
-                    for k in wav_keys:
-                        fname = k.split("/")[-1]
-                        w = self.s3.get_object(Bucket=self.bucket, Key=k)
-                        wav_bytes = w["Body"].read()
-
-                        sr, x = _read_wav_mono_float32(wav_bytes)
-                        duration_s = float(x.size) / float(sr) if sr > 0 else 0.0
-
-                        latency_s, beep_end_s, speech_onset_s, notes = estimate_latency_beep_to_speech(x, sr)
-
-                        out_records.append({
-                            "filename": fname,
-                            "date": date_str,
-                            "time": time_str,
-                            "duration_s": float(f"{duration_s:.2f}"),
-                            "latency_s": (None if latency_s is None else float(f"{latency_s:.3f}")),
-                            "beep_end_s": (None if beep_end_s is None else float(f"{beep_end_s:.3f}")),
-                            "speech_onset_s": (None if speech_onset_s is None else float(f"{speech_onset_s:.3f}")),
-                            "notes": notes,
-                            "s3_key": k,
-                        })
+                out_records = _fetch_voice_drift_records(
+                    self.s3, self.bucket, layout, user_id, dates,
+                )
 
                 if not out_records:
                     self.after(0, lambda: self._set_status("No voice_drift wavs found for this user."))
@@ -1532,6 +1833,188 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---------- ADL Export ----------
+    def on_adl_export(self):
+        """Export all tagged ADL segments across every session for the selected user.
+
+        For each session that has a .txt tag file:
+          - Parse the .txt to get (activity, radar, start_frame, end_frame) segments.
+          - Download the radar CSV and extract the matching rows.
+          - Tag rows with: label, source_file, segment_idx (0-based per activity per session).
+
+        Output: data/{user_id}_adl_export.csv
+        Prints a segment-count summary per activity to stdout and status bar.
+        """
+        if not self.s3 or not self.bucket:
+            messagebox.showinfo("Not connected", "Click Connect / Refresh first.")
+            return
+        user_id = self.cmb_id.get().strip()
+        if not user_id:
+            messagebox.showinfo("Missing selection", "Select a User ID first.")
+            return
+        if pd is None:
+            messagebox.showerror("Missing dependency", "pandas is required. pip install pandas")
+            return
+
+        self._set_status(f"ADL Export: scanning sessions for {user_id}…")
+        layout = self.layout or S3Layout(self.root_prefix)
+
+        # Collect stems already present per label so we skip re-exporting individual (label, stem) pairs.
+        # Using per-label tracking avoids skipping a session that has a missing label (e.g. tooth_brushing
+        # deleted locally but the session still appears in drinking.csv).
+        out_dir_check = Path("data") / "adl" / user_id
+        already_exported: dict[str, set[str]] = {}  # label -> set of stems
+        if out_dir_check.exists():
+            for csv_file in out_dir_check.glob("*.csv"):
+                label_name = csv_file.stem
+                try:
+                    existing = pd.read_csv(str(csv_file), usecols=["source_file"])
+                    already_exported[label_name] = set(existing["source_file"].dropna().unique())
+                except Exception:
+                    pass
+        total_already = sum(len(v) for v in already_exported.values())
+        if total_already:
+            print(f"[ADL Export] Per-label skip map built ({total_already} label×session pairs)")
+
+        def worker():
+            try:
+                dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
+                all_segments: list[pd.DataFrame] = []
+
+                for day in dates:
+                    day_prefix = pick_day_prefix(layout, self.s3, self.bucket, user_id, day)
+                    if not day_prefix:
+                        continue
+
+                    sub_prefixes = list_common_prefixes(self.s3, self.bucket, day_prefix)
+                    for p in sub_prefixes:
+                        name = p.rstrip("/").split("/")[-1]
+                        if name == "voice_drift":
+                            continue
+                        if not name.startswith(f"{user_id}-{day}-"):
+                            continue
+
+                        session_prefix = p  # ends with /
+                        if not session_has_any_txt(self.s3, self.bucket, session_prefix):
+                            continue
+
+                        # List objects in this session
+                        objs = list_objects(self.s3, self.bucket, session_prefix, max_items=500)
+                        keys = [o["Key"] for o in objs if "Key" in o]
+                        csv_keys = [k for k in keys if k.lower().endswith(".csv")
+                                    and "/voice_drift/" not in k]
+                        txt_keys = [k for k in keys if k.lower().endswith(".txt")]
+
+                        if not csv_keys or not txt_keys:
+                            continue
+
+                        csv_key = csv_keys[0]
+                        txt_key = txt_keys[0]
+                        stem = Path(csv_key).stem
+
+                        # Parse tag file
+                        txt_text = download_text_object(self.s3, self.bucket, txt_key)
+                        segs = _parse_adl_tags(txt_text)
+                        if not segs:
+                            continue
+
+                        # Skip the (expensive) CSV download if every (label, stem) is already exported
+                        if all(stem in already_exported.get(s["action"], set()) for s in segs):
+                            continue
+
+                        # Download radar CSV
+                        csv_text = download_text_object(self.s3, self.bucket, csv_key)
+                        df = pd.read_csv(io.StringIO(csv_text))
+                        if "frame_number" not in df.columns:
+                            continue
+
+                        # segment_idx counts separately per activity within this session
+                        seg_counters: dict[str, int] = {}
+
+                        for seg in segs:
+                            action = seg["action"]
+                            radar = seg["radar"]
+                            start = seg["start"]
+                            end = seg["end"]
+
+                            # Skip this (label, session) pair if already in the per-label CSV
+                            if stem in already_exported.get(action, set()):
+                                continue
+
+                            mask = (df["frame_number"] >= start) & (df["frame_number"] <= end)
+                            seg_df = df[mask].copy()
+                            if seg_df.empty:
+                                continue
+
+                            # Keep only columns for the tagged device(s)
+                            dev_cols = _select_device_cols(df.columns.tolist(), radar)
+                            keep = ["frame_number", "timestamp"] + dev_cols
+                            keep = [c for c in keep if c in seg_df.columns]
+                            seg_df = seg_df[keep].copy()
+
+                            seg_idx = seg_counters.get(action, 0)
+                            seg_counters[action] = seg_idx + 1
+
+                            seg_df.insert(0, "label", action)
+                            seg_df.insert(1, "source_file", stem)
+                            seg_df.insert(2, "segment_idx", seg_idx)
+                            all_segments.append(seg_df)
+
+                if not all_segments:
+                    msg = ("No new tagged sessions found — all already exported."
+                           if already_exported else "No tagged sessions found for this user.")
+                    self.after(0, lambda: self._set_status(f"ADL Export: {msg}"))
+                    self.after(0, lambda: messagebox.showinfo("ADL Export", msg))
+                    return
+
+                # Group by label and append to per-activity CSVs
+                out_dir = Path("data") / "adl" / user_id
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                from collections import defaultdict
+                by_label: dict[str, list[pd.DataFrame]] = defaultdict(list)
+                for seg_df in all_segments:
+                    lbl = seg_df["label"].iat[0]
+                    by_label[lbl].append(seg_df)
+
+                detail_lines = []
+                summary_parts = []
+                for lbl in sorted(by_label.keys()):
+                    frames_list = by_label[lbl]
+                    n_new_segs = len(frames_list)
+                    activity_df = pd.concat(frames_list, ignore_index=True)
+                    out_path = out_dir / f"{lbl}.csv"
+                    write_header = not out_path.exists()
+                    activity_df.to_csv(str(out_path), mode="a", index=False, header=write_header)
+
+                    # Count total segments in the file after appending
+                    try:
+                        total_df = pd.read_csv(str(out_path), usecols=["source_file", "segment_idx"])
+                        n_total_segs = len(total_df.drop_duplicates())
+                    except Exception:
+                        n_total_segs = n_new_segs
+
+                    print(f"[ADL Export] {lbl}: +{n_new_segs} new segments → total {n_total_segs} segments")
+                    detail_lines.append(f"  {lbl}: +{n_new_segs} new  (total {n_total_segs})")
+                    summary_parts.append(f"{lbl}: +{n_new_segs} / {n_total_segs} total")
+
+                summary = ", ".join(summary_parts)
+                detail_text = "\n".join(detail_lines)
+                print(f"[ADL Export] Done.\n{detail_text}")
+
+                status_msg = f"ADL Export done — {summary}"
+                self.after(0, lambda: self._set_status(status_msg))
+                self.after(0, lambda: messagebox.showinfo(
+                    "ADL Export",
+                    f"Activity  (+new / total segments):\n{detail_text}\n\nSaved to:\n{out_dir}/"))
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.after(0, lambda: self._set_status(f"ADL Export error: {e}"))
+                self.after(0, lambda: messagebox.showerror("ADL Export error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def main():
@@ -1550,9 +2033,9 @@ TAG_ACTIONS_DEFAULT = [
     "stand_to_sit",
     "hand_washing",
     "face_washing",
+    "hair_washing",
     "tooth_brushing",
     "drinking",
-    "lying",
 ]
 
 
@@ -1595,6 +2078,8 @@ def _compute_distance_mag(chirp_mat: np.ndarray, window: np.ndarray) -> np.ndarr
         return np.zeros((window.size // 2,), dtype=np.float32)
     if chirp_mat.ndim != 2:
         chirp_mat = np.asarray(chirp_mat).reshape(-1, window.size)
+    # DC removal per chirp: subtract per-chirp mean to avoid large DC spike at bin 0
+    chirp_mat = chirp_mat - chirp_mat.mean(axis=1, keepdims=True)
     xw = chirp_mat * window.reshape(1, -1)
     X = np.fft.fft(xw, axis=1)
     mag = np.abs(X).mean(axis=0).astype(np.float32)
@@ -1633,8 +2118,12 @@ def _compute_range_doppler_mag(
     if num_samples != win_rng.size:
         win_rng = np.hanning(num_samples).astype(np.float32)
 
+    # DC removal per chirp: subtract per-chirp mean to avoid large DC spike at bin 0
+    chirp_mat = chirp_mat.astype(np.float32)
+    chirp_mat = chirp_mat - chirp_mat.mean(axis=1, keepdims=True)
+
     # Range FFT per chirp (fast-time)
-    xw = chirp_mat.astype(np.float32) * win_rng.reshape(1, -1)
+    xw = chirp_mat * win_rng.reshape(1, -1)
     Xr = np.fft.fft(xw, axis=1)[:, : max(1, num_samples // 2)]  # (num_chirps, rng_bins)
 
     # Doppler FFT across chirps (slow-time) per range bin
@@ -2005,17 +2494,18 @@ class S3TaggerWindow:
 
         csv_key = self.session_keys[stem]
         base_key_dir = str(Path(csv_key).parent).replace("\\", "/")
-        mp4_key = f"{base_key_dir}/{stem}.mp4"
-        wav_key = f"{base_key_dir}/{stem}.wav"
-        # Tag file (TXT): action|radar: [(start,end), ...]
-        txt_key = f"{base_key_dir}/{stem}.txt"
+        mp4_key  = f"{base_key_dir}/{stem}.mp4"
+        wav_key  = f"{base_key_dir}/{stem}.wav"
+        txt_key  = f"{base_key_dir}/{stem}.txt"
+        meta_key = f"{base_key_dir}/{stem}_radar_meta.json"
 
         # local paths
-        sess_dir = self.cache_root / stem
-        csv_path = sess_dir / f"{stem}.csv"
-        mp4_path = sess_dir / f"{stem}.mp4"
-        wav_path = sess_dir / f"{stem}.wav"
-        txt_path = sess_dir / f"{stem}.txt"
+        sess_dir  = self.cache_root / stem
+        csv_path  = sess_dir / f"{stem}.csv"
+        mp4_path  = sess_dir / f"{stem}.mp4"
+        wav_path  = sess_dir / f"{stem}.wav"
+        txt_path  = sess_dir / f"{stem}.txt"
+        meta_path = sess_dir / f"{stem}_radar_meta.json"
         sess_dir.mkdir(parents=True, exist_ok=True)
 
         self._set_info("Downloading session assets…")
@@ -2040,6 +2530,12 @@ class S3TaggerWindow:
                     # ok: no existing tags yet
                     if txt_path.exists():
                         txt_path.unlink(missing_ok=True)
+                try:
+                    _s3_download_to_file(self.s3, self.bucket, meta_key, meta_path)
+                except Exception:
+                    # ok: old sessions without radar meta
+                    if meta_path.exists():
+                        meta_path.unlink(missing_ok=True)
 
                 def ui_update():
                     self._load_local_session(
@@ -2048,6 +2544,7 @@ class S3TaggerWindow:
                         mp4_path if mp4_path.exists() else None,
                         wav_path if wav_path.exists() else None,
                         txt_path if txt_path.exists() else None,
+                        meta_path if meta_path.exists() else None,
                     )
                     self._set_info("Loaded.")
 
@@ -2065,6 +2562,7 @@ class S3TaggerWindow:
             mp4_path: Path | None,
             wav_path: Path | None,
             txt_path: Path | None,
+            meta_path: Path | None = None,
     ):
         if pd is None:
             messagebox.showerror("Missing dependency", "pandas is required for tagging window. pip install pandas")
@@ -2146,9 +2644,18 @@ class S3TaggerWindow:
                 d0 = np.mean(np.abs(np.diff(self.dev0_mag, axis=0)), axis=1)
                 d1 = np.mean(np.abs(np.diff(self.dev1_mag, axis=0)), axis=1)
 
-                # Robust thresholds: 75th percentile + small epsilon.
-                th0 = float(np.percentile(d0, 75)) if d0.size else 0.0
-                th1 = float(np.percentile(d1, 75)) if d1.size else 0.0
+                # Robust thresholds: median + 3*MAD (scaled).
+                # 75th-percentile always flags 25% of frames even in static recordings.
+                # MAD-based threshold only fires when a frame genuinely deviates from baseline.
+                def _mad_threshold(arr, k=3.0):
+                    if arr.size == 0:
+                        return 0.0
+                    med = float(np.median(arr))
+                    mad = float(np.median(np.abs(arr - med))) * 1.4826  # scale to sigma
+                    return med + k * max(mad, 1e-9)
+
+                th0 = _mad_threshold(d0)
+                th1 = _mad_threshold(d1)
 
                 # Convert to per-frame flags (frame 0 has no previous frame).
                 for i in range(1, self.N):
@@ -2191,6 +2698,17 @@ class S3TaggerWindow:
                 self.audio_params = None
                 self.audio_frames = None
 
+        # Apply PRF from radar metadata if available; fall back to 2000.0 for old sessions
+        # that predate the physics fields in _radar_meta.json.
+        if meta_path is not None and meta_path.exists():
+            try:
+                radar_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                prf = float(radar_meta.get("prf_hz", 0.0))
+                if prf > 0.0:
+                    self.doppler_prf_hz = prf
+            except Exception:
+                pass  # leave self.doppler_prf_hz at its default (2000.0)
+
         # initialize view
         self.current_frame = 0
         self._update_view(0)
@@ -2206,11 +2724,21 @@ class S3TaggerWindow:
         if self.audio_params is None:
             return False
         ch, sw, sr = self.audio_params
+        new_params = (int(sr), int(-8 * sw), int(ch))
         try:
-            if not getattr(self, "_pygame_inited", False):
+            prev_params = getattr(self, "_pygame_mixer_params", None)
+            if not getattr(self, "_pygame_inited", False) or prev_params != new_params:
+                # Reinit if never initialized, or if a new session has different audio parameters
+                # (e.g. 44100 Hz stereo → 16000 Hz mono). Without reinit, audio plays at wrong speed.
+                if getattr(self, "_pygame_inited", False):
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
                 # size is in bits; negative => signed
-                pygame.mixer.init(frequency=int(sr), size=int(-8 * sw), channels=int(ch))
+                pygame.mixer.init(frequency=new_params[0], size=new_params[1], channels=new_params[2])
                 self._pygame_inited = True
+                self._pygame_mixer_params = new_params
         except Exception:
             return False
         return True
@@ -2328,12 +2856,12 @@ class S3TaggerWindow:
             return
         self._update_view(self.current_frame)
 
-        # auto-fill a small suggested tag range (like original tagger)
-        start = self.current_frame
+        # auto-fill a small suggested tag range (1-indexed, matching save_range validation)
         w = int(getattr(self, 'window_size', 16) or 16)
         if w <= 0:
             w = 1
-        end = min(self.current_frame + w - 1, self.N - 1)
+        start = self.current_frame + 1            # 1-indexed
+        end = min(self.current_frame + w, self.N) # 1-indexed, capped at N
         self.range_entry.delete(0, tk.END)
         self.range_entry.insert(0, f"({start},{end})")
 
