@@ -10,8 +10,8 @@ Processing chain per frame:
     → DopplerAlgo  (range FFT + MTI + Doppler FFT)
     → complex Range-Doppler map  (64 range bins × 64 Doppler bins)
     → log1p magnitude            (compresses dynamic range)
-    → (64, 64, 4) float32 array
-      channels: rx0_mag, rx1_mag, rx2_mag, doppler_proj
+    → (64, 64, 6) float32 array
+      channels: rx0_mag, rx1_mag, rx2_mag, doppler_proj_rx0, doppler_proj_rx1, doppler_proj_rx2
 
 Processing chain per segment:
   N frames of (64, 64, 4)
@@ -22,7 +22,7 @@ Processing chain per segment:
 
 Outputs saved to  data/adl_features/{user}/ :
   adl_features.npz  — compressed arrays:
-                        X: (N_windows, window, 64, 64, 4)  float32
+                        X: (N_windows, window, 64, 64, 6)  float32
                         y: (N_windows,)                     int32
   label_map.json    — { "activity_name": class_index, ... }
   meta.csv          — traceability: label / source_file / segment_idx / window_idx
@@ -68,10 +68,13 @@ def _segment_to_rdmaps(frames_data: list[tuple]) -> np.ndarray:
     A fresh DopplerAlgo is created per segment so the MTI history does not
     bleed between unrelated segments.
 
-    Returns ndarray shape (N_frames, 64, 64, 4).
+    Returns ndarray shape (N_frames, 64, 64, 6).
     Channel layout:
       0-2  rx0_mag, rx1_mag, rx2_mag  — log-magnitude RD maps
-      3    doppler_projection          — Doppler energy profile (tiled)
+      3-5  doppler_proj_rx0/1/2       — per-channel Doppler energy profile (tiled)
+             sum over range bins for each Rx independently → (64,) each,
+             tiled to (64, 64).  Keeping channels separate preserves inter-channel
+             Doppler differences that encode the angle/elevation of motion.
     """
     algo = DopplerAlgo(NUM_SAMPLES, NUM_CHIRPS, NUM_CHANNELS)
     rd_maps = []
@@ -83,19 +86,18 @@ def _segment_to_rdmaps(frames_data: list[tuple]) -> np.ndarray:
         mag0 = np.log1p(np.abs(rd0)).astype(np.float32)
         mag1 = np.log1p(np.abs(rd1)).astype(np.float32)
         mag2 = np.log1p(np.abs(rd2)).astype(np.float32)
-        mag3 = np.stack([mag0, mag1, mag2], axis=-1)      # (64, 64, 3)
 
-        # Channel 3: Doppler projection — sum over range bins, average across
-        # receive channels → (64,) Doppler energy profile, tiled to (64, 64).
-        doppler_proj = mag3.sum(axis=0).mean(axis=-1)     # (64,)
-        doppler_ch   = np.tile(doppler_proj[None, :], (64, 1))  # (64, 64)
+        def _proj(mag):
+            proj = mag.sum(axis=0)                            # (64,)
+            return np.tile(proj[None, :], (64, 1))[:, :, None]  # (64, 64, 1)
 
-        frame_4ch = np.concatenate(
-            [mag3, doppler_ch[:, :, None]],
+        frame_6ch = np.concatenate(
+            [mag0[:, :, None], mag1[:, :, None], mag2[:, :, None],
+             _proj(mag0), _proj(mag1), _proj(mag2)],
             axis=-1
-        )                                                 # (64, 64, 4)
-        rd_maps.append(frame_4ch)
-    return np.array(rd_maps, dtype=np.float32)           # (N, 64, 64, 4)
+        )                                                     # (64, 64, 6)
+        rd_maps.append(frame_6ch)
+    return np.array(rd_maps, dtype=np.float32)               # (N, 64, 64, 6)
 
 
 # ── Sliding window ────────────────────────────────────────────────────────────

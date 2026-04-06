@@ -8,8 +8,8 @@ Architecture:
      fed into a GRU, which learns the temporal rhythm of each activity.
   3. A small MLP head maps the GRU's final hidden state to class scores.
 
-Input shape:  (batch, 16 frames, 64 range bins, 64 Doppler bins, 4 channels)
-              channels: rx0_mag, rx1_mag, rx2_mag, doppler_proj
+Input shape:  (batch, T frames, 64 range bins, 64 Doppler bins, 6 channels)
+              channels: rx0_mag, rx1_mag, rx2_mag, doppler_proj_rx0, doppler_proj_rx1, doppler_proj_rx2
 Output shape: (batch, num_classes)
 """
 
