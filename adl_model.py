@@ -17,6 +17,112 @@ import torch
 import torch.nn as nn
 
 
+class _CNNBackbone1D(nn.Module):
+    """1D CNN that summarises one frame's (bins, channels) profile into a feature vector.
+
+    Applied independently to every frame in the window (shared weights).
+    Three Conv1d-BN-ReLU-MaxPool blocks reduce (in_channels, 64) → (64, 4),
+    then flatten → 256 → Linear(out_dim).
+    """
+
+    def __init__(self, out_dim: int = 64, in_channels: int = 6):
+        super().__init__()
+        self.net = nn.Sequential(
+            # Block 1 — (in_channels, 64) → (16, 32)
+            nn.Conv1d(in_channels, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(16),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
+            nn.MaxPool1d(2),
+
+            # Block 2 — (16, 32) → (32, 16)
+            nn.Conv1d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
+            nn.MaxPool1d(2),
+
+            # Block 3 — (32, 16) → (64, 4)
+            nn.Conv1d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
+            nn.AdaptiveAvgPool1d(4),
+
+            nn.Flatten(),                       # → 256
+            nn.Linear(64 * 4, out_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class ADLClassifier1D(nn.Module):
+    """
+    1D CNN + BiGRU classifier for ADL radar data using 1D profile features.
+
+    Input shape:  (batch, T frames, 64 bins, 6 channels)
+                  channels: range_proj_rx0/1/2, doppler_proj_rx0/1/2
+    Output shape: (batch, num_classes)
+    """
+
+    def __init__(
+        self,
+        num_classes:   int,
+        cnn_out_dim:   int   = 64,
+        gru_hidden:    int   = 64,
+        gru_layers:    int   = 2,
+        dropout:       float = 0.4,
+        bidirectional: bool  = True,
+        in_channels:   int   = 6,
+    ):
+        super().__init__()
+        self.cnn           = _CNNBackbone1D(out_dim=cnn_out_dim, in_channels=in_channels)
+        self.bidirectional = bidirectional
+
+        self.gru = nn.GRU(
+            input_size=cnn_out_dim,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if gru_layers > 1 else 0.0,
+        )
+
+        clf_in = gru_hidden * 2 if bidirectional else gru_hidden
+        self.classifier = nn.Sequential(
+            nn.Linear(clf_in, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, T, bins, C)  — T=frames, bins=64, C=channels
+
+        Returns:
+            logits: (batch, num_classes)
+        """
+        B, T, bins, C = x.shape
+
+        x = x.permute(0, 1, 3, 2)        # (B, T, C, bins)
+        x = x.reshape(B * T, C, bins)     # (B*T, C, bins) — Conv1d expects (N, C, L)
+
+        features = self.cnn(x)            # (B*T, cnn_out_dim)
+        features = features.view(B, T, -1)  # (B, T, cnn_out_dim)
+
+        _, h_n = self.gru(features)
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+        else:
+            h_last = h_n[-1]
+
+        return self.classifier(h_last)
+
+
 class _CNNBackbone(nn.Module):
     """2D CNN that summarises one radar frame into a feature vector.
 

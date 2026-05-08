@@ -1,30 +1,48 @@
 """
 ADL Classifier — Training Script
 ==================================
-Trains the CNN+GRU model defined in adl_model.py on features produced by
-adl_feature_extraction.py.
+Trains a CNN+GRU classifier on features produced by adl_feature_extraction.py.
+Two model architectures are supported, selected automatically from the feature file:
+
+  ADLClassifier   (2D)  — CNN2D backbone + BiGRU
+    input : (batch, T, 64, 64, C)   — Range-Doppler maps
+    output: best_model_2d_w<T>_ch<C>.pt
+
+  ADLClassifier1D (1D)  — CNN1D backbone + BiGRU
+    input : (batch, T, 64, C)        — range/Doppler projections
+    output: best_model_1d_w<T>_ch<C>.pt
 
 Key design decisions:
-  - Train/val split is done by SOURCE SESSION (source_file), not by individual
-    windows.  This prevents data leakage where adjacent frames from the same
-    recording appear in both splits.
-  - Class weights compensate for any imbalance between activity counts.
+  - Train/val split is by SOURCE SESSION (source_file), not individual windows.
+    Prevents data leakage from adjacent frames of the same recording.
+  - Class weights compensate for activity count imbalance.
   - Data augmentation during training: Gaussian noise, random time shift,
-    random channel dropout.
-  - Best model (by val accuracy) is saved as  data/adl_features/{user}/best_model.pt
+    random channel dropout, magnitude scaling.
+  - Best model (by val accuracy) is saved to data/adl_features/{user}/.
 
 Usage (GUI — default):
   python adl_train.py
 
-Usage (CLI):
+Usage (CLI — 2D model, all activities):
   python adl_train.py --nogui
-  python adl_train.py --nogui --user peter --epochs 60 --batch_size 32 --lr 1e-3
+  python adl_train.py --nogui --user peter --epochs 80 --batch_size 32 --lr 1e-3
+
+Usage (CLI — 1D model, all activities):
+  python adl_train.py --nogui --model 1d
+  python adl_train.py --nogui --model 1d --epochs 80
+
+Usage (CLI — bathroom subset, 1D model):
+  python adl_train.py --nogui --model 1d --tag bathroom
+
+Usage (CLI — bathroom subset, 2D model):
+  python adl_train.py --nogui --model 2d --tag bathroom
 """
 
 import json
 import argparse
 import random
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +53,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import confusion_matrix, classification_report
 
-from adl_model import ADLClassifier
+from adl_model import ADLClassifier, ADLClassifier1D
 
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
@@ -69,24 +87,26 @@ class ADLDataset(Dataset):
         noise_std: float = 0.05,
         max_shift: int = 4,
         channel_drop_prob: float = 0.2,
+        is_1d: bool = False,
     ):
-        self.X = X.astype(np.float32)
+        self.X = X.astype(np.float32, copy=False)
         self.y = y.astype(np.int64)
         self.augment = augment
         self.noise_std = noise_std
         self.max_shift = max_shift
         self.channel_drop_prob = channel_drop_prob
+        self.is_1d = is_1d
 
     def __len__(self) -> int:
         return len(self.y)
 
     def __getitem__(self, idx: int):
-        x = self.X[idx].copy()   # (T, H, W, C)
+        x = self.X[idx].copy()   # (T, bins, C) for 1D  or  (T, H, W, C) for 2D
 
         if self.augment:
             # 1. Gaussian noise
             x += np.random.normal(0, self.noise_std, x.shape).astype(np.float32)
-            x = np.clip(x, 0.0, None)
+            x = np.clip(x, -5.0, 5.0)
 
             # 2. Random time shift (roll frames, wraps around)
             if self.max_shift > 0:
@@ -96,11 +116,7 @@ class ADLDataset(Dataset):
             # 3. Random channel dropout
             if random.random() < self.channel_drop_prob:
                 ch = random.randint(0, x.shape[-1] - 1)
-                x[:, :, :, ch] = 0.0
-
-            # 4. Random magnitude scaling — simulates distance/orientation variation
-            scale = np.random.uniform(0.7, 1.3)
-            x = x * scale
+                x[..., ch] = 0.0
 
         return torch.from_numpy(x), self.y[idx]
 
@@ -194,16 +210,41 @@ def train(
     set_seed(args.seed)
 
     feature_dir = Path("data") / "adl_features" / args.user
-    npz_path    = feature_dir / "adl_features.npz"
-    meta_path   = feature_dir / "meta.csv"
-    label_path  = feature_dir / "label_map.json"
+
+    # ── Resolve suffix before existence check ─────────────────────────────────
+    _feat_type = getattr(args, 'feature_type', 'rdmap')
+    is_1d = _feat_type == '1d_profile'
+    is_ra = _feat_type == 'rdmap_ramap'
+    tag    = getattr(args, 'tag', '')
+    window = getattr(args, 'window', None)
+    if window:
+        if is_1d:
+            model_type = "1d";    ch_count = 6
+        elif is_ra:
+            model_type = "2d_ra"; ch_count = 5
+        else:
+            model_type = "2d";    ch_count = 3
+        suffix = f"_{model_type}_w{window}_ch{ch_count}"
+        if tag:
+            suffix = f"{suffix}_{tag}"
+    else:
+        if is_1d:
+            suffix = "_1d"
+        elif is_ra:
+            suffix = "_2d_ra"
+        else:
+            suffix = ""
+        if tag:
+            suffix = f"{suffix}_{tag}"
+    npz_path   = feature_dir / f"adl_features{suffix}.npz"
+    meta_path  = feature_dir / f"meta{suffix}.csv"
+    label_path = feature_dir / f"label_map{suffix}.json"
 
     if not npz_path.exists():
         log_fn(f"Feature file not found: {npz_path}")
         log_fn("Run adl_feature_extraction.py first.")
         return
 
-    # ── Load data ─────────────────────────────────────────────────────────────
     data        = np.load(str(npz_path))
     X, y        = data["X"], data["y"]
     meta        = pd.read_csv(str(meta_path))
@@ -211,20 +252,38 @@ def train(
     label_names = [k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
     num_classes = len(label_names)
 
-    if getattr(args, "channels", 0) > 0:
-        X = X[:, :, :, :, :args.channels]
+    channel_indices = getattr(args, "channel_indices", None)
+    if not is_1d:
+        if channel_indices:
+            idx = [int(c) for c in channel_indices.split(",")]
+            X = X[:, :, :, :, idx]
+        elif getattr(args, "channels", 0) > 0:
+            X = X[:, :, :, :, :args.channels]
 
     in_channels = X.shape[-1]
+    out_suffix  = f"_{'1d' if is_1d else '2d'}_w{X.shape[1]}_ch{in_channels}"
+    out_tag = getattr(args, 'out_tag', '')
+    if out_tag:
+        out_suffix += f"_{out_tag}"
     log_fn(f"Loaded  X: {X.shape}  y: {y.shape}")
-    ch_desc = {3: "mag only", 4: "mag + doppler_proj",
-               5: "mag + doppler_proj + temporal_max",
-               6: "mag + doppler_proj + temporal_max + IPD"}.get(in_channels, f"{in_channels} channels")
+    _all_ch_names = ["rx0_mag", "rx1_mag", "rx2_mag", "ra_map", "re_map"]
+    if channel_indices:
+        idx = [int(c) for c in channel_indices.split(",")]
+        ch_desc = "+".join(_all_ch_names[i] for i in idx if i < len(_all_ch_names))
+    else:
+        ch_desc = {
+            3: "rx0_mag + rx1_mag + rx2_mag",
+            5: "rx0_mag + rx1_mag + rx2_mag + ra_map + re_map",
+        }.get(in_channels, f"{in_channels} channels")
     log_fn(f"Channels: {in_channels}  ({ch_desc})")
     log_fn(f"Window:   {X.shape[1]} frames  ({X.shape[1]/5:.1f}s at 5 Hz)")
     log_fn(f"Classes : {label_names}\n")
 
     # ── Optional class filter ─────────────────────────────────────────────────
-    selected = getattr(args, 'selected_classes', None)
+    exclude  = [c.strip() for c in getattr(args, 'exclude_classes', '').split(',') if c.strip()]
+    selected = getattr(args, 'selected_classes', None) or (
+        [c for c in label_names if c not in exclude] if exclude else None
+    )
     if selected:
         keep_ids  = sorted([label_map[c] for c in selected if c in label_map])
         unknown   = [c for c in selected if c not in label_map]
@@ -240,6 +299,8 @@ def train(
         num_classes = len(label_names)
         log_fn(f"Filtered to {num_classes} classes: {label_names}")
         log_fn(f"Remaining windows: {len(X)}\n")
+        if exclude and not out_tag:
+            out_suffix += f"_{num_classes}cls"
 
     # ── Session-level split ───────────────────────────────────────────────────
     train_idx, val_idx = session_split(meta, val_ratio=args.val_ratio,
@@ -250,53 +311,33 @@ def train(
     log_fn(f"Val   sessions: {len(meta.loc[val_idx,   'source_file'].unique()):3d}  "
            f"({len(val_idx)} windows)\n")
 
-    # ── Normalization ─────────────────────────────────────────────────────────
-    # Two-group normalization handles the different value ranges:
-    #   Magnitude channels (0-2): log1p of small floats → max-scale to [0, 1]
-    #   Angle channels (3-4):     already in [-1, 1]   → mean/std normalize
-    # A single global std would be dominated by angle channel statistics,
-    # making magnitude channels vanish; per-element std amplifies noise.
-    X_train_raw = X[train_idx].astype(np.float32)
+    # ── Per-session z-score normalization ─────────────────────────────────────
+    # Normalize each recording session independently (grouped by source_file).
+    # This removes position/distance-dependent absolute levels while preserving
+    # relative energy differences between windows within a session — so
+    # no_motion still looks quiet and walk_away still looks energetic.
+    t_norm = time.time()
 
-    if in_channels > 3:
-        mag_max  = float(X_train_raw[:, :, :, :, :3].max())
-        mag_max  = max(mag_max, 1e-6)       # guard against all-zero data
+    # Per-window z-score: normalize each window independently so that
+    # training and real-time inference use identical normalization.
+    # Per-session was better in theory but inference only has one window at a
+    # time, so the mismatch caused false positives (background noise amplified
+    # to look like low-amplitude periodic activities such as hair_washing).
+    X_norm = X.astype(np.float32, copy=True)
+    X_flat = X_norm.reshape(len(X_norm), -1, in_channels)   # (N, spatial, C)
+    m = X_flat.mean(axis=1, keepdims=True)                   # (N, 1, C)
+    s = X_flat.std( axis=1, keepdims=True) + 1e-8            # (N, 1, C)
+    X_flat = (X_flat - m) / s
+    X_norm = X_flat.reshape(X_norm.shape)
 
-        # Normalize each extra channel independently so doppler_proj (large scale,
-        # always positive) does not dominate the z-score of the angle maps (small
-        # scale, signed).  Each channel c gets its own mean/std computed on train.
-        extra_means = []
-        extra_stds  = []
-        for c in range(3, in_channels):
-            ch_data = X_train_raw[:, :, :, :, c]
-            m = float(ch_data.mean())
-            s = float(ch_data.std()) + 1e-8
-            extra_means.append(m)
-            extra_stds.append(s)
-            log_fn(f"  Extra ch{c}:          mean={m:+.4f}  std={s:.4f}")
-
-        log_fn(f"  Magnitude (ch0-2):   max={mag_max:.6f}  → scaled to [0, 1]")
-
-        X_f    = X.astype(np.float32)
-        X_norm = X_f.copy()
-        X_norm[:, :, :, :, :3] = X_f[:, :, :, :, :3] / mag_max
-        for i, c in enumerate(range(3, in_channels)):
-            X_norm[:, :, :, :, c] = (X_f[:, :, :, :, c] - extra_means[i]) / extra_stds[i]
-
-        norm_mean = [0.0] + extra_means   # [mag_offset, ch3_mean, ch4_mean, ...]
-        norm_std  = [mag_max] + extra_stds  # [mag_scale,  ch3_std,  ch4_std,  ...]
-    else:
-        norm_mean_v = float(X_train_raw.mean())
-        norm_std_v  = float(X_train_raw.std()) + 1e-8
-        log_fn(f"  Global: mean={norm_mean_v:+.4f}  std={norm_std_v:.4f}  "
-               f"min={X_train_raw.min():.4f}  max={X_train_raw.max():.4f}")
-        X_norm = (X.astype(np.float32) - norm_mean_v) / norm_std_v
-        norm_mean = norm_mean_v
-        norm_std  = norm_std_v
+    norm_mean = "per_window"
+    norm_std  = "per_window"
+    log_fn(f"  Per-window z-score: {len(X_norm)} windows, "
+           f"{in_channels} channels  (matches real-time inference, {time.time()-t_norm:.1f}s)")
 
     # ── Datasets & loaders ────────────────────────────────────────────────────
-    train_ds = ADLDataset(X_norm[train_idx], y[train_idx], augment=True)
-    val_ds   = ADLDataset(X_norm[val_idx],   y[val_idx],   augment=False)
+    train_ds = ADLDataset(X_norm[train_idx], y[train_idx], augment=True,  is_1d=is_1d)
+    val_ds   = ADLDataset(X_norm[val_idx],   y[val_idx],   augment=False, is_1d=is_1d)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=False)
@@ -306,16 +347,28 @@ def train(
     # ── Model, loss, optimiser ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_fn(f"Device: {device}\n")
+    t_train = time.time()
 
-    model = ADLClassifier(
-        num_classes=num_classes,
-        cnn_out_dim=64,
-        gru_hidden=64,
-        gru_layers=2,
-        dropout=getattr(args, 'dropout', 0.4),
-        bidirectional=True,
-        in_channels=in_channels,
-    ).to(device)
+    if is_1d:
+        model = ADLClassifier1D(
+            num_classes=num_classes,
+            cnn_out_dim=64,
+            gru_hidden=64,
+            gru_layers=2,
+            dropout=getattr(args, 'dropout', 0.4),
+            bidirectional=True,
+            in_channels=in_channels,
+        ).to(device)
+    else:
+        model = ADLClassifier(
+            num_classes=num_classes,
+            cnn_out_dim=64,
+            gru_hidden=64,
+            gru_layers=2,
+            dropout=getattr(args, 'dropout', 0.4),
+            bidirectional=True,
+            in_channels=in_channels,
+        ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log_fn(f"Model parameters: {n_params:,}\n")
@@ -332,7 +385,7 @@ def train(
     best_val_acc  = 0.0
     best_epoch    = 0
     patience_left = args.early_stop
-    model_path    = feature_dir / "best_model.pt"
+    model_path    = feature_dir / f"best_model{out_suffix}.pt"
 
     log_fn(f"{'Epoch':>6}  {'Train loss':>10}  {'Train acc':>9}  "
            f"{'Val loss':>8}  {'Val acc':>7}  {'LR':>8}")
@@ -382,7 +435,12 @@ def train(
                    f"(no improvement for {args.early_stop} epochs)")
             break
 
-    log_fn(f"\nBest val accuracy: {best_val_acc:.1%}  at epoch {best_epoch}")
+    log_fn(f"\nBest val accuracy: {best_val_acc:.1%}  at epoch {best_epoch}  "
+           f"(training time: {time.time()-t_train:.0f}s)")
+    acc_int = round(best_val_acc * 100)
+    new_model_path = model_path.parent / f"{model_path.stem}_acc{acc_int}{model_path.suffix}"
+    model_path.replace(new_model_path)
+    model_path = new_model_path
     log_fn(f"Model saved → {model_path}")
 
     # ── Final evaluation ──────────────────────────────────────────────────────
@@ -439,7 +497,7 @@ def train(
                        fontsize=9,
                        color="white" if cm[i, j] > thresh else "black")
     plt.tight_layout()
-    cm_path = feature_dir / "confusion_matrix.png"
+    cm_path = feature_dir / f"confusion_matrix{out_suffix}.png"
     fig_cm.savefig(str(cm_path), dpi=150)
     plt.close(fig_cm)
     log_fn(f"\nConfusion matrix saved → {cm_path}")
@@ -468,7 +526,7 @@ def train(
             log_fn("\t".join(str(m[c]) for c in header_cols))
 
     mismatch_df  = pd.DataFrame(mismatches)
-    mismatch_path = feature_dir / "mismatches.tsv"
+    mismatch_path = feature_dir / f"mismatches{out_suffix}.tsv"
     mismatch_df.to_csv(str(mismatch_path), sep="\t", index=False)
     log_fn(f"\nMismatch table saved → {mismatch_path}")
 
@@ -485,7 +543,7 @@ def train(
 
 def launch_gui() -> None:
     import tkinter as tk
-    from tkinter import ttk, filedialog
+    from tkinter import ttk, filedialog, messagebox
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -547,6 +605,37 @@ def launch_gui() -> None:
             ttk.Button(frm_cfg, text="Browse…",
                        command=self._browse_feat).grid(row=0, column=6, padx=2)
 
+            # Model type selector
+            ttk.Label(frm_cfg, text="Model:").grid(
+                row=1, column=0, sticky="w", pady=2)
+            self._model_var = tk.StringVar(value="2d")
+            ttk.Radiobutton(frm_cfg, text="2D (RD-map)   ADLClassifier",
+                            variable=self._model_var, value="2d").grid(
+                row=1, column=1, columnspan=2, sticky="w")
+            ttk.Radiobutton(frm_cfg, text="2D (RD+RA+RE)   ADLClassifier",
+                            variable=self._model_var, value="2d_ra").grid(
+                row=1, column=3, columnspan=2, sticky="w")
+            ttk.Radiobutton(frm_cfg, text="1D (projection)   ADLClassifier1D",
+                            variable=self._model_var, value="1d").grid(
+                row=1, column=5, columnspan=2, sticky="w")
+            self._model_var.trace_add("write", self._on_model_change)
+
+            # Feature file selector
+            ttk.Label(frm_cfg, text="Feature file:").grid(
+                row=2, column=0, sticky="w", pady=2)
+            self._npz_var = tk.StringVar()
+            self._npz_combo = ttk.Combobox(frm_cfg, textvariable=self._npz_var,
+                                           state="readonly", width=40)
+            self._npz_combo.grid(row=2, column=1, columnspan=5, sticky="ew", padx=4)
+            ttk.Button(frm_cfg, text="↺ Refresh",
+                       command=self._refresh_npz_list).grid(row=2, column=6, padx=2)
+            self._feat_var.trace_add("write", lambda *_: self._refresh_npz_list())
+
+            # Channel selection vars (5 channels max); default: all selected
+            _CH_NAMES = ["rx0_mag", "rx1_mag", "rx2_mag", "ra_map", "re_map"]
+            self._ch_names = _CH_NAMES
+            self._chan_vars = [tk.BooleanVar(value=True) for _ in range(5)]
+
             # Hyperparameters row 1
             def _lbl_spin(parent, row, col, text, var, lo, hi, w=7):
                 ttk.Label(parent, text=text).grid(
@@ -555,39 +644,39 @@ def launch_gui() -> None:
                             textvariable=var, width=w).grid(
                     row=row, column=col + 1, padx=4)
 
-            self._epochs_var   = tk.IntVar(value=80)
+            self._epochs_var   = tk.IntVar(value=120)
             self._batch_var    = tk.IntVar(value=32)
             self._lr_var       = tk.DoubleVar(value=1e-3)
             self._val_var      = tk.DoubleVar(value=0.2)
-            self._estop_var    = tk.IntVar(value=15)
+            self._estop_var    = tk.IntVar(value=20)
             self._seed_var     = tk.IntVar(value=42)
             self._dropout_var  = tk.DoubleVar(value=0.4)
             self._wd_var       = tk.DoubleVar(value=5e-4)
 
-            _lbl_spin(frm_cfg, 1, 0, "Epochs:",      self._epochs_var, 1,  500)
-            _lbl_spin(frm_cfg, 1, 2, "Batch size:",  self._batch_var,  4,  256)
-            ttk.Label(frm_cfg, text="LR:").grid(row=1, column=4, sticky="w", padx=(8, 0))
+            _lbl_spin(frm_cfg, 3, 0, "Epochs:",      self._epochs_var, 1,  500)
+            _lbl_spin(frm_cfg, 3, 2, "Batch size:",  self._batch_var,  4,  256)
+            ttk.Label(frm_cfg, text="LR:").grid(row=3, column=4, sticky="w", padx=(8, 0))
             ttk.Entry(frm_cfg, textvariable=self._lr_var, width=8).grid(
-                row=1, column=5, padx=4)
-
-            _lbl_spin(frm_cfg, 2, 0, "Val ratio:",   self._val_var,    0.05, 0.5,  w=5)
-            _lbl_spin(frm_cfg, 2, 2, "Early stop:",  self._estop_var,  1,    100)
-            _lbl_spin(frm_cfg, 2, 4, "Seed:",        self._seed_var,   0,    9999)
-
-            ttk.Label(frm_cfg, text="Dropout:").grid(row=3, column=0, sticky="w", padx=(8, 0))
-            ttk.Entry(frm_cfg, textvariable=self._dropout_var, width=8).grid(
-                row=3, column=1, padx=4)
-            ttk.Label(frm_cfg, text="(0.0–0.7 | overfitting → increase)",
-                      foreground="#888").grid(row=3, column=2, columnspan=2, sticky="w")
-            ttk.Label(frm_cfg, text="Weight decay:").grid(row=3, column=4, sticky="w", padx=(8, 0))
-            ttk.Entry(frm_cfg, textvariable=self._wd_var, width=8).grid(
                 row=3, column=5, padx=4)
+
+            _lbl_spin(frm_cfg, 4, 0, "Val ratio:",   self._val_var,    0.05, 0.5,  w=5)
+            _lbl_spin(frm_cfg, 4, 2, "Early stop:",  self._estop_var,  1,    100)
+            _lbl_spin(frm_cfg, 4, 4, "Seed:",        self._seed_var,   0,    9999)
+
+            ttk.Label(frm_cfg, text="Dropout:").grid(row=5, column=0, sticky="w", padx=(8, 0))
+            ttk.Entry(frm_cfg, textvariable=self._dropout_var, width=8).grid(
+                row=5, column=1, padx=4)
+            ttk.Label(frm_cfg, text="(0.0–0.7 | overfitting → increase)",
+                      foreground="#888").grid(row=5, column=2, columnspan=2, sticky="w")
+            ttk.Label(frm_cfg, text="Weight decay:").grid(row=5, column=4, sticky="w", padx=(8, 0))
+            ttk.Entry(frm_cfg, textvariable=self._wd_var, width=8).grid(
+                row=5, column=5, padx=4)
             ttk.Label(frm_cfg, text="(e.g. 5e-4 | overfitting → increase)",
-                      foreground="#888").grid(row=3, column=6, sticky="w")
+                      foreground="#888").grid(row=5, column=6, sticky="w")
 
             # Buttons
             btn_row = ttk.Frame(frm_cfg)
-            btn_row.grid(row=4, column=0, columnspan=7, sticky="e", pady=(6, 0))
+            btn_row.grid(row=6, column=0, columnspan=7, sticky="e", pady=(6, 0))
             self._run_btn  = ttk.Button(btn_row, text="▶  Start Training",
                                         command=self._start)
             self._stop_btn = ttk.Button(btn_row, text="■  Stop",
@@ -596,10 +685,13 @@ def launch_gui() -> None:
                                             command=self._show_model_overview)
             self._data_btn = ttk.Button(btn_row, text="📊  Data Overview",
                                            command=self._show_data_overview)
+            self._chan_btn = ttk.Button(btn_row, text="⚙  Channels…",
+                                        command=self._open_channel_dialog)
             self._run_btn.pack(side="left", padx=4)
             self._stop_btn.pack(side="left", padx=4)
             self._overview_btn.pack(side="left", padx=4)
             self._data_btn.pack(side="left", padx=4)
+            self._chan_btn.pack(side="left", padx=4)
 
             # ── Progress bar ──────────────────────────────────────────────────
             frm_prog = ttk.Frame(self)
@@ -640,6 +732,7 @@ def launch_gui() -> None:
             self._build_results_tab()
             self._build_cm_tab()
             self._build_mismatch_tab()
+            self._refresh_npz_list()
 
         # ── Notebook tabs ──────────────────────────────────────────────────────
 
@@ -747,16 +840,33 @@ def launch_gui() -> None:
             # Derive user from folder name
             user = feat_dir.name
 
+            _model_type = self._model_var.get()
+            _n_ch = 5 if _model_type == "2d_ra" else 3
+            selected_ch = [i for i, v in enumerate(self._chan_vars[:_n_ch]) if v.get()]
+            ch_indices_str = ",".join(str(i) for i in selected_ch) if len(selected_ch) < _n_ch else ""
+
+            # Parse window size from selected feature filename e.g. adl_features_2d_w50_ch6.npz
+            import re as _re
+            npz_name = self._npz_var.get()
+            m = _re.search(r'_w(\d+)_ch\d+', npz_name)
+            parsed_window = int(m.group(1)) if m else None
+
             args = argparse.Namespace(
-                user       = user,
-                epochs     = self._epochs_var.get(),
-                batch_size = self._batch_var.get(),
-                lr         = float(self._lr_var.get()),
-                val_ratio  = float(self._val_var.get()),
-                early_stop   = self._estop_var.get(),
-                seed         = self._seed_var.get(),
-                dropout      = float(self._dropout_var.get()),
-                weight_decay = float(self._wd_var.get()),
+                user            = user,
+                epochs          = self._epochs_var.get(),
+                batch_size      = self._batch_var.get(),
+                lr              = float(self._lr_var.get()),
+                val_ratio       = float(self._val_var.get()),
+                early_stop      = self._estop_var.get(),
+                seed            = self._seed_var.get(),
+                dropout         = float(self._dropout_var.get()),
+                weight_decay    = float(self._wd_var.get()),
+                feature_type    = ("1d_profile" if _model_type == "1d"
+                                   else "rdmap_ramap" if _model_type == "2d_ra"
+                                   else "rdmap"),
+                channel_indices = ch_indices_str,
+                window          = parsed_window,
+                tag             = "",
             )
 
             # Override feature_dir resolution: patch the Path inside train()
@@ -800,6 +910,63 @@ def launch_gui() -> None:
                     self.after(0, self._on_done)
 
             threading.Thread(target=worker, daemon=True).start()
+
+        def _refresh_npz_list(self):
+            feat_dir   = Path(self._feat_var.get())
+            model_type = self._model_var.get()   # "2d", "2d_ra", or "1d"
+            if model_type == "2d":
+                pattern = "adl_features_2d_w*.npz"   # excludes 2d_ra
+            elif model_type == "2d_ra":
+                pattern = "adl_features_2d_ra_*.npz"
+            else:
+                pattern = "adl_features_1d_*.npz"
+            files      = sorted(feat_dir.glob(pattern)) if feat_dir.is_dir() else []
+            names      = [f.name for f in files]
+            self._npz_combo["values"] = names
+            if names:
+                current = self._npz_var.get()
+                self._npz_var.set(current if current in names else names[-1])
+            else:
+                self._npz_var.set("")
+
+        def _on_model_change(self, *_):
+            state = "normal" if self._model_var.get() in ("2d", "2d_ra") else "disabled"
+            self._chan_btn.configure(state=state)
+            self._refresh_npz_list()
+
+        def _open_channel_dialog(self):
+            dlg = tk.Toplevel(self)
+            dlg.title("Select Channels")
+            dlg.resizable(False, False)
+            dlg.grab_set()
+
+            ttk.Label(dlg, text="2D model input channels:",
+                      font=("", 9, "bold")).pack(anchor="w", padx=14, pady=(10, 4))
+
+            groups = [("Range-Doppler maps", [0, 1, 2])]
+            if self._model_var.get() == "2d_ra":
+                groups.append(("Angle maps (Capon MVDR)", [3, 4]))
+            for group_label, indices in groups:
+                grp = ttk.LabelFrame(dlg, text=group_label, padding=6)
+                grp.pack(fill="x", padx=10, pady=4)
+                for i in indices:
+                    ttk.Checkbutton(grp, text=f"  ch{i}  {self._ch_names[i]}",
+                                    variable=self._chan_vars[i]).pack(anchor="w")
+
+            def _apply():
+                chosen = [i for i, v in enumerate(self._chan_vars) if v.get()]
+                if not chosen:
+                    messagebox.showwarning("No channels",
+                        "At least one channel must be selected.", parent=dlg)
+                    return
+                dlg.destroy()
+
+            btn_row = ttk.Frame(dlg)
+            btn_row.pack(pady=(6, 10))
+            ttk.Button(btn_row, text="OK", width=10, command=_apply).pack(
+                side="left", padx=6)
+            ttk.Button(btn_row, text="Cancel", width=10,
+                       command=dlg.destroy).pack(side="left", padx=6)
 
         def _stop(self):
             self._stop_event.set()
@@ -965,8 +1132,10 @@ def launch_gui() -> None:
             from tkinter import ttk, messagebox
 
             feat_dir  = Path(self._feat_var.get())
-            meta_path = feat_dir / "meta.csv"
-            npz_path  = feat_dir / "adl_features.npz"
+            npz_name  = self._npz_var.get()
+            stem      = npz_name.replace("adl_features", "").replace(".npz", "") if npz_name else ""
+            meta_path = feat_dir / f"meta{stem}.csv"
+            npz_path  = feat_dir / npz_name if npz_name else feat_dir / "adl_features.npz"
 
             if not meta_path.exists():
                 messagebox.showwarning(
@@ -1273,7 +1442,36 @@ if __name__ == "__main__":
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--channels",     type=int,   default=0,
                    help="Use only first N channels (0 = use all)")
+    p.add_argument("--channel_indices", type=str, default="",
+                   help="Comma-separated channel indices to use, e.g. '3,4,5' for doppler_proj only")
+    p.add_argument("--window", type=int, default=None,
+                   help="Window size used during extraction, e.g. 50 "
+                        "→ loads adl_features_2d_w50_ch3.npz (2D) or _ch6.npz (1D)")
+    p.add_argument("--tag", default="",
+                   help="Optional extra tag appended after auto-name, "
+                        "e.g. 'bathroom' → adl_features_2d_w50_ch6_bathroom.npz")
+    p.add_argument("--out_tag", default="",
+                   help="Override the output model filename tag independently of --tag, "
+                        "e.g. '6ch' → saves best_model_6ch.pt without changing the feature file")
+    p.add_argument("--exclude-classes", dest="exclude_classes", default="",
+                   help="Comma-separated class names to exclude, "
+                        "e.g. 'sit_to_stand,stand_to_sit'")
+    p.add_argument("--model", default="2d", choices=["2d", "2d_ra", "1d"],
+                   help="Model type: '2d' (RD maps 3ch), '2d_ra' (RD+RA+RE 5ch), "
+                        "or '1d' (projections 6ch, ADLClassifier1D)")
+    p.add_argument("--feature_type", default=None,
+                   choices=["rdmap", "1d_profile"],
+                   help="Alias for --model: 'rdmap'='2d', '1d_profile'='1d' (legacy)")
     args = p.parse_args()
+
+    # Resolve model type: --feature_type overrides --model (legacy compat)
+    if args.feature_type is None:
+        if args.model == "1d":
+            args.feature_type = "1d_profile"
+        elif args.model == "2d_ra":
+            args.feature_type = "rdmap_ramap"
+        else:
+            args.feature_type = "rdmap"
 
     if args.nogui:
         train(args)

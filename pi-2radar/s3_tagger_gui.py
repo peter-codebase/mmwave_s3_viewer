@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-s3_post_analyze_gui_voice_drift_latency.py
+s3_tagger_gui.py
 
 GUI goals (Phase 1):
 - Connect to S3 using AWS creds from a chosen .env (default: ./.env)
@@ -1103,54 +1103,6 @@ def _fetch_voice_drift_records(
     return records
 
 
-# ---------------- ADL Export helpers ----------------
-
-def _parse_adl_tags(txt_text: str) -> list[dict]:
-    """Parse ADL tag file content into segment dicts.
-
-    Format per line:  activity|dev0: [(start, end), ...]
-    Returns list of {"action": str, "radar": str, "start": int, "end": int}.
-    Frame indices are 1-based inclusive.
-    """
-    segs: list[dict] = []
-    for line in txt_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            left, ranges_str = line.split(":", 1)
-            left = left.strip()
-            ranges = ast.literal_eval(ranges_str.strip())
-            if isinstance(ranges, tuple):
-                ranges = [ranges]
-            if not isinstance(ranges, list):
-                ranges = [ranges]
-            radar = "both"
-            act = left
-            if "|" in left:
-                act, radar = [x.strip() for x in left.split("|", 1)]
-                radar = radar.lower()
-                if radar not in {"dev0", "dev1", "both"}:
-                    radar = "both"
-            for s, e in ranges:
-                segs.append({"action": str(act).strip(), "radar": radar,
-                             "start": int(s), "end": int(e)})
-        except Exception:
-            continue
-    return segs
-
-
-def _select_device_cols(all_cols: list[str], radar: str) -> list[str]:
-    """Return chirp data column names for the given device(s)."""
-    if radar == "dev0":
-        prefixes = ("dev0_",)
-    elif radar == "dev1":
-        prefixes = ("dev1_",)
-    else:  # both
-        prefixes = ("dev0_", "dev1_")
-    return [c for c in all_cols if any(c.startswith(p) for p in prefixes)]
-
-
 # ---------------- GUI ----------------
 
 class App(tk.Tk):
@@ -1217,13 +1169,6 @@ class App(tk.Tk):
         )
         ttk.Button(frm_sel, text="Tag data", command=self.on_open_tagger).grid(
             row=0, column=7, padx=(10, 0), sticky="w"
-        )
-
-        ttk.Button(frm_sel, text="ADL Export", command=self.on_adl_export).grid(
-            row=1, column=0, columnspan=2, pady=(6, 0), sticky="w"
-        )
-        ttk.Button(frm_sel, text="Edit Sessions", command=self.on_edit_sessions).grid(
-            row=1, column=2, padx=(10, 0), pady=(6, 0), sticky="w"
         )
 
         # Results table
@@ -1836,378 +1781,6 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---------- Edit Sessions ----------
-    def on_edit_sessions(self):
-        """Open a dialog listing all unique sessions across data/adl/{user_id}/*.csv.
-
-        Each row = one session stem.  Deleting a session removes its rows from
-        every per-activity CSV it appears in.
-        """
-        user_id = self.cmb_id.get().strip()
-        if not user_id:
-            messagebox.showinfo("Missing selection", "Select a User ID first.")
-            return
-        if pd is None:
-            messagebox.showerror("Missing dependency", "pandas is required.")
-            return
-
-        adl_dir = Path("data") / "adl" / user_id
-        if not adl_dir.exists():
-            messagebox.showinfo("No data", f"No ADL data found at {adl_dir}\nRun ADL Export first.")
-            return
-
-        # ── Load all CSVs; build session → {activity, ...} mapping ───────────
-        csv_map: dict[str, Path] = {}          # activity -> Path
-        # session_info: source_file -> {activities, total_rows}
-        from collections import defaultdict
-        session_activities: dict[str, set[str]] = defaultdict(set)
-        session_rows: dict[str, int] = defaultdict(int)
-
-        for csv_path in sorted(adl_dir.glob("*.csv")):
-            activity = csv_path.stem
-            try:
-                df = pd.read_csv(str(csv_path), usecols=["source_file"])
-            except Exception:
-                continue
-            csv_map[activity] = csv_path
-            for src, grp in df.groupby("source_file"):
-                session_activities[str(src)].add(activity)
-                session_rows[str(src)] += len(grp)
-
-        if not session_activities:
-            messagebox.showinfo("No sessions", "No sessions found in ADL data.")
-            return
-
-        sessions = sorted(session_activities.keys())
-
-        # ── Build dialog ──────────────────────────────────────────────────────
-        dlg = tk.Toplevel(self)
-        dlg.title(f"Edit Sessions — {user_id}")
-        dlg.geometry("820x480")
-        dlg.resizable(True, True)
-
-        ttk.Label(dlg, text="Click a row to check/uncheck it. Click Delete Selected to remove checked sessions.\n"
-                            "Deleting a session removes it from all activity files.").pack(
-            anchor="w", padx=10, pady=(8, 2))
-
-        frm_tree = ttk.Frame(dlg)
-        frm_tree.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-
-        CHK_OFF = "☐"
-        CHK_ON  = "☑"
-        checked: set[str] = set()   # iids of checked rows
-
-        cols = ("check", "source_file", "activities", "rows")
-        tv = ttk.Treeview(frm_tree, columns=cols, show="headings",
-                          selectmode="none", height=18)
-        tv.heading("check",       text="")
-        tv.heading("source_file", text="Session (source file stem)")
-        tv.heading("activities",  text="Activities")
-        tv.heading("rows",        text="Total rows")
-        tv.column("check",       width=30,  anchor="center", stretch=False)
-        tv.column("source_file", width=360, anchor="w")
-        tv.column("activities",  width=320, anchor="w")
-        tv.column("rows",        width=70,  anchor="center")
-
-        sb = ttk.Scrollbar(frm_tree, orient="vertical", command=tv.yview)
-        tv.configure(yscrollcommand=sb.set)
-        tv.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        for src in sessions:
-            acts = ", ".join(sorted(session_activities[src]))
-            tv.insert("", "end", values=(CHK_OFF, src, acts, session_rows[src]))
-
-        def _toggle(event):
-            iid = tv.identify_row(event.y)
-            if not iid:
-                return
-            vals = list(tv.item(iid, "values"))
-            if iid in checked:
-                checked.discard(iid)
-                vals[0] = CHK_OFF
-                tv.item(iid, tags=())
-            else:
-                checked.add(iid)
-                vals[0] = CHK_ON
-                tv.item(iid, tags=("checked",))
-            tv.item(iid, values=vals)
-            status_var.set(f"{len(tv.get_children())} sessions  |  {len(checked)} selected")
-
-        tv.tag_configure("checked", background="#cce5ff")
-        tv.bind("<Button-1>", _toggle)
-
-        # ── Select-all / deselect-all ─────────────────────────────────────────
-        frm_sel_all = ttk.Frame(dlg)
-        frm_sel_all.pack(anchor="w", padx=10)
-
-        def _select_all():
-            for iid in tv.get_children():
-                if iid not in checked:
-                    checked.add(iid)
-                    vals = list(tv.item(iid, "values"))
-                    vals[0] = CHK_ON
-                    tv.item(iid, values=vals, tags=("checked",))
-            status_var.set(f"{len(tv.get_children())} sessions  |  {len(checked)} selected")
-
-        def _deselect_all():
-            for iid in list(checked):
-                vals = list(tv.item(iid, "values"))
-                vals[0] = CHK_OFF
-                tv.item(iid, values=vals, tags=())
-            checked.clear()
-            status_var.set(f"{len(tv.get_children())} sessions  |  0 selected")
-
-        ttk.Button(frm_sel_all, text="Select All",   command=_select_all).pack(side="left", padx=(0, 4))
-        ttk.Button(frm_sel_all, text="Deselect All", command=_deselect_all).pack(side="left")
-
-        status_var = tk.StringVar(value=f"{len(sessions)} sessions  |  0 selected")
-        ttk.Label(dlg, textvariable=status_var, foreground="gray").pack(anchor="w", padx=10, pady=(4, 0))
-
-        frm_btn = ttk.Frame(dlg)
-        frm_btn.pack(anchor="e", padx=10, pady=(4, 10))
-
-        def _delete_selected():
-            if not checked:
-                messagebox.showinfo("Nothing selected", "Check at least one session first.",
-                                    parent=dlg)
-                return
-
-            stems_to_del = {tv.item(iid, "values")[1] for iid in checked}
-
-            summary = "\n".join(f"  {s}" for s in sorted(stems_to_del)[:20])
-            if len(stems_to_del) > 20:
-                summary += f"\n  … and {len(stems_to_del) - 20} more"
-            if not messagebox.askyesno(
-                    "Confirm deletion",
-                    f"Delete {len(stems_to_del)} session(s) from all activity files?\n\n{summary}",
-                    parent=dlg):
-                return
-
-            errors = []
-            deleted_rows = 0
-            affected_files = 0
-            for activity, csv_path in list(csv_map.items()):
-                if not csv_path.exists():
-                    continue
-                try:
-                    df = pd.read_csv(str(csv_path))
-                    before = len(df)
-                    df = df[~df["source_file"].isin(stems_to_del)]
-                    after = len(df)
-                    if after == before:
-                        continue
-                    deleted_rows += (before - after)
-                    affected_files += 1
-                    if df.empty:
-                        csv_path.unlink()
-                        del csv_map[activity]
-                    else:
-                        df.to_csv(str(csv_path), index=False)
-                except Exception as e:
-                    errors.append(f"{activity}: {e}")
-
-            for iid in list(checked):
-                tv.delete(iid)
-            checked.clear()
-
-            remaining = len(tv.get_children())
-            status_var.set(f"{remaining} sessions remaining — {deleted_rows} rows deleted from {affected_files} file(s)")
-
-            if errors:
-                messagebox.showerror("Errors", "\n".join(errors), parent=dlg)
-            else:
-                messagebox.showinfo("Done",
-                                    f"Deleted {deleted_rows} rows across {affected_files} activity file(s).",
-                                    parent=dlg)
-
-        ttk.Button(frm_btn, text="Delete Selected", command=_delete_selected).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(frm_btn, text="Close", command=dlg.destroy).pack(side="left")
-
-    # ---------- ADL Export ----------
-    def on_adl_export(self):
-        """Export all tagged ADL segments across every session for the selected user.
-
-        For each session that has a .txt tag file:
-          - Parse the .txt to get (activity, radar, start_frame, end_frame) segments.
-          - Download the radar CSV and extract the matching rows.
-          - Tag rows with: label, source_file, segment_idx (0-based per activity per session).
-
-        Output: data/{user_id}_adl_export.csv
-        Prints a segment-count summary per activity to stdout and status bar.
-        """
-        if not self.s3 or not self.bucket:
-            messagebox.showinfo("Not connected", "Click Connect / Refresh first.")
-            return
-        user_id = self.cmb_id.get().strip()
-        if not user_id:
-            messagebox.showinfo("Missing selection", "Select a User ID first.")
-            return
-        if pd is None:
-            messagebox.showerror("Missing dependency", "pandas is required. pip install pandas")
-            return
-
-        self._set_status(f"ADL Export: scanning sessions for {user_id}…")
-        layout = self.layout or S3Layout(self.root_prefix)
-
-        # Collect stems already present per label so we skip re-exporting individual (label, stem) pairs.
-        # Using per-label tracking avoids skipping a session that has a missing label (e.g. tooth_brushing
-        # deleted locally but the session still appears in drinking.csv).
-        out_dir_check = Path("data") / "adl" / user_id
-        already_exported: dict[str, set[str]] = {}  # label -> set of stems
-        if out_dir_check.exists():
-            for csv_file in out_dir_check.glob("*.csv"):
-                label_name = csv_file.stem
-                try:
-                    existing = pd.read_csv(str(csv_file), usecols=["source_file"])
-                    already_exported[label_name] = set(existing["source_file"].dropna().unique())
-                except Exception:
-                    pass
-        total_already = sum(len(v) for v in already_exported.values())
-        if total_already:
-            print(f"[ADL Export] Per-label skip map built ({total_already} label×session pairs)")
-
-        def worker():
-            try:
-                dates = list_dates_for_user(layout, self.s3, self.bucket, user_id)
-                all_segments: list[pd.DataFrame] = []
-
-                for day in dates:
-                    day_prefix = pick_day_prefix(layout, self.s3, self.bucket, user_id, day)
-                    if not day_prefix:
-                        continue
-
-                    sub_prefixes = list_common_prefixes(self.s3, self.bucket, day_prefix)
-                    for p in sub_prefixes:
-                        name = p.rstrip("/").split("/")[-1]
-                        if name == "voice_drift":
-                            continue
-                        if not name.startswith(f"{user_id}-{day}-"):
-                            continue
-
-                        session_prefix = p  # ends with /
-                        if not session_has_any_txt(self.s3, self.bucket, session_prefix):
-                            continue
-
-                        # List objects in this session
-                        objs = list_objects(self.s3, self.bucket, session_prefix, max_items=500)
-                        keys = [o["Key"] for o in objs if "Key" in o]
-                        csv_keys = [k for k in keys if k.lower().endswith(".csv")
-                                    and "/voice_drift/" not in k]
-                        txt_keys = [k for k in keys if k.lower().endswith(".txt")]
-
-                        if not csv_keys or not txt_keys:
-                            continue
-
-                        csv_key = csv_keys[0]
-                        txt_key = txt_keys[0]
-                        stem = Path(csv_key).stem
-
-                        # Parse tag file
-                        txt_text = download_text_object(self.s3, self.bucket, txt_key)
-                        segs = _parse_adl_tags(txt_text)
-                        if not segs:
-                            continue
-
-                        # Skip the (expensive) CSV download if every (label, stem) is already exported
-                        if all(stem in already_exported.get(s["action"], set()) for s in segs):
-                            continue
-
-                        # Download radar CSV
-                        csv_text = download_text_object(self.s3, self.bucket, csv_key)
-                        df = pd.read_csv(io.StringIO(csv_text))
-                        if "frame_number" not in df.columns:
-                            continue
-
-                        # segment_idx counts separately per activity within this session
-                        seg_counters: dict[str, int] = {}
-
-                        for seg in segs:
-                            action = seg["action"]
-                            radar = seg["radar"]
-                            start = seg["start"]
-                            end = seg["end"]
-
-                            # Skip this (label, session) pair if already in the per-label CSV
-                            if stem in already_exported.get(action, set()):
-                                continue
-
-                            mask = (df["frame_number"] >= start) & (df["frame_number"] <= end)
-                            seg_df = df[mask].copy()
-                            if seg_df.empty:
-                                continue
-
-                            # Keep only columns for the tagged device(s)
-                            dev_cols = _select_device_cols(df.columns.tolist(), radar)
-                            keep = ["frame_number", "timestamp"] + dev_cols
-                            keep = [c for c in keep if c in seg_df.columns]
-                            seg_df = seg_df[keep].copy()
-
-                            seg_idx = seg_counters.get(action, 0)
-                            seg_counters[action] = seg_idx + 1
-
-                            seg_df.insert(0, "label", action)
-                            seg_df.insert(1, "source_file", stem)
-                            seg_df.insert(2, "segment_idx", seg_idx)
-                            all_segments.append(seg_df)
-
-                if not all_segments:
-                    msg = ("No new tagged sessions found — all already exported."
-                           if already_exported else "No tagged sessions found for this user.")
-                    self.after(0, lambda: self._set_status(f"ADL Export: {msg}"))
-                    self.after(0, lambda: messagebox.showinfo("ADL Export", msg))
-                    return
-
-                # Group by label and append to per-activity CSVs
-                out_dir = Path("data") / "adl" / user_id
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                from collections import defaultdict
-                by_label: dict[str, list[pd.DataFrame]] = defaultdict(list)
-                for seg_df in all_segments:
-                    lbl = seg_df["label"].iat[0]
-                    by_label[lbl].append(seg_df)
-
-                detail_lines = []
-                summary_parts = []
-                for lbl in sorted(by_label.keys()):
-                    frames_list = by_label[lbl]
-                    n_new_segs = len(frames_list)
-                    activity_df = pd.concat(frames_list, ignore_index=True)
-                    out_path = out_dir / f"{lbl}.csv"
-                    write_header = not out_path.exists()
-                    activity_df.to_csv(str(out_path), mode="a", index=False, header=write_header)
-
-                    # Count total segments in the file after appending
-                    try:
-                        total_df = pd.read_csv(str(out_path), usecols=["source_file", "segment_idx"])
-                        n_total_segs = len(total_df.drop_duplicates())
-                    except Exception:
-                        n_total_segs = n_new_segs
-
-                    print(f"[ADL Export] {lbl}: +{n_new_segs} new segments → total {n_total_segs} segments")
-                    detail_lines.append(f"  {lbl}: +{n_new_segs} new  (total {n_total_segs})")
-                    summary_parts.append(f"{lbl}: +{n_new_segs} / {n_total_segs} total")
-
-                summary = ", ".join(summary_parts)
-                detail_text = "\n".join(detail_lines)
-                print(f"[ADL Export] Done.\n{detail_text}")
-
-                status_msg = f"ADL Export done — {summary}"
-                self.after(0, lambda: self._set_status(status_msg))
-                self.after(0, lambda: messagebox.showinfo(
-                    "ADL Export",
-                    f"Activity  (+new / total segments):\n{detail_text}\n\nSaved to:\n{out_dir}/"))
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.after(0, lambda: self._set_status(f"ADL Export error: {e}"))
-                self.after(0, lambda: messagebox.showerror("ADL Export error", str(e)))
-
-        threading.Thread(target=worker, daemon=True).start()
-
 
 def main():
     App().mainloop()
@@ -2338,44 +1911,6 @@ def _compute_range_doppler_mag(
     return rd_mag, vel
 
 
-def _compute_rd_complex(chirp_mat: np.ndarray, win_rng: np.ndarray) -> np.ndarray:
-    """Return complex range-Doppler map, shape (rng_bins, dop_bins), for use with _capon_angle_map."""
-    if chirp_mat.size == 0 or chirp_mat.ndim != 2:
-        return np.zeros((1, 1), dtype=np.complex64)
-    num_chirps, num_samples = chirp_mat.shape
-    if num_samples != win_rng.size:
-        win_rng = np.hanning(num_samples).astype(np.float32)
-    chirp_mat = chirp_mat.astype(np.float32)
-    chirp_mat -= chirp_mat.mean(axis=1, keepdims=True)
-    xw = chirp_mat * win_rng.reshape(1, -1)
-    Xr = np.fft.fft(xw, axis=1)[:, : max(1, num_samples // 2)]      # (chirps, rng_bins) complex
-    win_dop = np.hanning(max(1, num_chirps)).astype(np.float32).reshape(-1, 1)
-    Xd = np.fft.fftshift(np.fft.fft(Xr * win_dop, axis=0), axes=0)  # (dop_bins, rng_bins) complex
-    return Xd.T.astype(np.complex64)                                  # → (rng_bins, dop_bins)
-
-
-def _capon_angle_map(rd_a: np.ndarray, rd_b: np.ndarray, n_angles: int = 64) -> np.ndarray:
-    """Vectorised Capon (MVDR) range-angle map from two complex RD maps.
-
-    Args:
-        rd_a, rd_b: complex (rng_bins, dop_bins) from two Rx antennas (e.g. Rx1 & Rx3 for azimuth).
-    Returns:
-        float32 (rng_bins, n_angles), log1p-normalised.
-    """
-    n_range, n_doppler = rd_a.shape
-    X   = np.stack([rd_a, rd_b], axis=1).astype(np.complex64)         # (rng, 2, dop)
-    R   = (X @ X.conj().transpose(0, 2, 1)) / n_doppler               # (rng, 2, 2)
-    diag_load = np.real(np.diagonal(R, axis1=1, axis2=2)).mean(axis=1)
-    R  += np.maximum(diag_load * 0.01, 1e-10)[:, None, None] * np.eye(2, dtype=np.complex64)[None]
-    R_inv = np.linalg.inv(R)                                           # (rng, 2, 2)
-    angles = np.linspace(-np.pi / 2, np.pi / 2, n_angles)
-    A   = np.stack([np.ones(n_angles, dtype=np.complex64),
-                    np.exp(1j * 2 * np.pi * 0.5 * np.sin(angles)).astype(np.complex64)],
-                   axis=-1)                                            # (A, 2)
-    AR  = np.einsum('ai,rij->raj', A.conj(), R_inv)                   # (A, rng, 2)
-    den = np.einsum('raj,aj->ra', AR, A).real                         # (rng, A)
-    return np.log1p(1.0 / (np.abs(den) + 1e-10)).astype(np.float32)    # (rng, A)
-
 
 class S3TaggerWindow:
     """
@@ -2406,6 +1941,8 @@ class S3TaggerWindow:
         self.win = tk.Toplevel(parent)
         self.win.title(f"Tagger — {user_id}-{day}")
         self.win.geometry("1200x720")
+        self.win.lift()
+        self.win.focus_force()
 
         # session selection
         self.session_var = tk.StringVar(value="")
@@ -2439,7 +1976,7 @@ class S3TaggerWindow:
         self.actions = TAG_ACTIONS_DEFAULT.copy()
         self.action_var = tk.StringVar(value=self.actions[0])
         # which radar data the tag refers to (dev0/dev1/both)
-        self.radar_var = tk.StringVar(value="both")
+        self.radar_var = tk.StringVar(value="dev0")
         self.tagged_ranges_frame = None
 
 
@@ -2567,58 +2104,32 @@ class S3TaggerWindow:
 
         # matplotlib plot
         self.fig = None
-        self.ax0 = self.ax0_az = self.ax0_el = None
-        self.ax1 = self.ax1_az = self.ax1_el = None
-        self.line0 = self.line1 = None
-        self.im0 = self.im1 = None
-        self.im0_az = self.im0_el = None
-        self.im1_az = self.im1_el = None
+        self.ax0 = None
+        self.ax1 = None
+        self.line0 = None
+        self.line1 = None
+        self.im0 = None
+        self.im1 = None
         self.canvas = None
 
         if plt is None or FigureCanvasTkAgg is None:
             tk.Label(left, text="matplotlib not available; install matplotlib to see plots.", fg="red").pack()
         else:
-            from matplotlib.gridspec import GridSpec
-            self.fig = plt.Figure(figsize=(12.0, 3.8), dpi=100)
-            gs = GridSpec(2, 3, figure=self.fig,
-                          width_ratios=[1.5, 1, 1],
-                          hspace=0.62, wspace=0.50,
-                          left=0.07, right=0.97, top=0.93, bottom=0.13)
-            self.ax0    = self.fig.add_subplot(gs[0, 0])   # dev0 Doppler / Range FFT
-            self.ax0_az = self.fig.add_subplot(gs[0, 1])   # dev0 Range-Azimuth
-            self.ax0_el = self.fig.add_subplot(gs[0, 2])   # dev0 Range-Elevation
-            self.ax1    = self.fig.add_subplot(gs[1, 0])   # dev1 Doppler / Range FFT
-            self.ax1_az = self.fig.add_subplot(gs[1, 1])   # dev1 Range-Azimuth
-            self.ax1_el = self.fig.add_subplot(gs[1, 2])   # dev1 Range-Elevation
+            self.fig = plt.Figure(figsize=(7.0, 5.4), dpi=100)
+            self.ax0 = self.fig.add_subplot(211)
+            self.ax1 = self.fig.add_subplot(212)
 
-            # Artists configured lazily in _update_view()
-            self.line0 = self.line1 = None
-            self.im0 = self.im1 = None
-            self.im0_az = self.im0_el = None
-            self.im1_az = self.im1_el = None
+            # Increase vertical separation to avoid title/xlabel overlap
+            self.fig.subplots_adjust(hspace=0.65, left=0.10, right=0.97, top=0.94, bottom=0.11)
 
-            # Wrap canvas in a horizontally scrollable container
-            self._plot_scroll_frame = tk.Frame(left)
-            self._plot_scroll_frame.pack(fill="both", expand=True)
-            self._plot_hscroll = ttk.Scrollbar(self._plot_scroll_frame, orient="horizontal")
-            self._plot_hscroll.pack(side="bottom", fill="x")
-            self._plot_scroll_canvas = tk.Canvas(
-                self._plot_scroll_frame,
-                xscrollcommand=self._plot_hscroll.set,
-                highlightthickness=0,
-            )
-            self._plot_hscroll.config(command=self._plot_scroll_canvas.xview)
-            self._plot_scroll_canvas.pack(fill="both", expand=True)
+            # Artists (lines / heatmaps) are configured lazily in _update_view()
+            self.line0 = None
+            self.line1 = None
+            self.im0 = None
+            self.im1 = None
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self._plot_scroll_canvas)
-            _plot_widget = self.canvas.get_tk_widget()
-            self._plot_scroll_canvas.create_window((0, 0), window=_plot_widget, anchor="nw")
-            _plot_widget.bind(
-                "<Configure>",
-                lambda e: self._plot_scroll_canvas.configure(
-                    scrollregion=self._plot_scroll_canvas.bbox("all")
-                ),
-            )
+            self.canvas = FigureCanvasTkAgg(self.fig, master=left)
+            self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         # video preview
         tk.Label(right, text="Video", font=("Arial", 10, "bold")).pack(anchor="w")
@@ -3207,97 +2718,42 @@ class S3TaggerWindow:
         if mode == getattr(self, "_last_plot_mode", None):
             return
 
-        # Reset Doppler/RangeFFT axes and artists
-        for ax in (self.ax0, self.ax1):
-            try:
-                ax.cla()
-            except Exception:
-                pass
-        self.line0 = self.line1 = None
-        self.im0 = self.im1 = None
-
-        # Reset angle-map axes and artists
-        for ax in (self.ax0_az, self.ax0_el, self.ax1_az, self.ax1_el):
-            try:
-                if ax is not None:
-                    ax.cla()
-            except Exception:
-                pass
-        self.im0_az = self.im0_el = None
-        self.im1_az = self.im1_el = None
+        # Reset axes and artists
+        try:
+            self.ax0.cla()
+            self.ax1.cla()
+        except Exception:
+            pass
+        self.line0 = None
+        self.line1 = None
+        self.im0 = None
+        self.im1 = None
 
         if mode == "Doppler FFT":
-            self.ax0.set_title("dev0 — Doppler", fontsize=9)
-            self.ax1.set_title("dev1 — Doppler", fontsize=9)
-            self.ax0.set_xlabel("Distance (m)", fontsize=8)
-            self.ax1.set_xlabel("Distance (m)", fontsize=8)
-            self.ax0.set_ylabel("Velocity (m/s)", fontsize=8)
-            self.ax1.set_ylabel("Velocity (m/s)", fontsize=8)
+            self.ax0.set_title("dev0 — Doppler FFT (velocity vs distance)")
+            self.ax1.set_title("dev1 — Doppler FFT (velocity vs distance)")
+            self.ax0.set_xlabel("Distance (m)")
+            self.ax1.set_xlabel("Distance (m)")
+            self.ax0.set_ylabel("Velocity (m/s)")
+            self.ax1.set_ylabel("Velocity (m/s)")
         else:
-            self.ax0.set_title("dev0 — Range FFT", fontsize=9)
-            self.ax1.set_title("dev1 — Range FFT", fontsize=9)
+            self.ax0.set_title("dev0 — Range FFT (distance vs amplitude)")
+            self.ax1.set_title("dev1 — Range FFT (distance vs amplitude)")
             self.ax0.set_xlabel("")
             self.ax0.tick_params(labelbottom=False)
-            self.ax1.set_xlabel("Distance (m)", fontsize=8)
-            self.ax0.set_ylabel("Amplitude", fontsize=8)
-            self.ax1.set_ylabel("Amplitude", fontsize=8)
+            self.ax1.set_xlabel("Distance (m)")
+            self.ax0.set_ylabel("Amplitude")
+            self.ax1.set_ylabel("Amplitude")
             (self.line0,) = self.ax0.plot([], [])
             (self.line1,) = self.ax1.plot([], [])
 
-        # Angle-map axes labels (same for both modes)
-        for ax, title in [(self.ax0_az, "dev0  Range-Azimuth"),
-                          (self.ax0_el, "dev0  Range-Elevation"),
-                          (self.ax1_az, "dev1  Range-Azimuth"),
-                          (self.ax1_el, "dev1  Range-Elevation")]:
-            if ax is None:
-                continue
-            ax.set_title(title, fontsize=9)
-            ax.set_xlabel("Angle (°)", fontsize=8)
-            ax.set_ylabel("Range (m)", fontsize=8)
-            ax.tick_params(labelsize=7)
-
         self._last_plot_mode = mode
 
+        try:
+            self.fig.subplots_adjust(hspace=0.65, left=0.10, right=0.97, top=0.94, bottom=0.11)
+        except Exception:
+            pass
 
-    # ---------- Angle-map rendering ----------
-    def _render_capon_maps(self, row, win_rng: np.ndarray):
-        """Compute and render Capon MVDR range-angle maps for both devices."""
-        if self.range_axis is None or self.range_axis.size == 0:
-            return
-        x0 = float(self.range_axis[0])
-        x1 = float(self.range_axis[-1])
-        angle_axis = np.degrees(np.arcsin(np.linspace(-1.0, 1.0, 64)))
-        angle_min, angle_max = float(angle_axis[0]), float(angle_axis[-1])
-        extent = (angle_min, angle_max, x0, x1)
-
-        def _render_one(ax, im_attr: str, angle_map: np.ndarray):
-            mn, mx = float(angle_map.min()), float(angle_map.max())
-            img = np.zeros_like(angle_map) if mx <= mn else ((angle_map - mn) / (mx - mn))
-            im = getattr(self, im_attr)
-            if im is None:
-                im = ax.imshow(img, origin="lower", aspect="auto", extent=extent,
-                               cmap="plasma", vmin=0.0, vmax=1.0)
-                setattr(self, im_attr, im)
-            else:
-                im.set_data(img)
-                im.set_extent(extent)
-
-        for prefix, ax_az, az_attr, ax_el, el_attr in [
-            ("dev0", self.ax0_az, "im0_az", self.ax0_el, "im0_el"),
-            ("dev1", self.ax1_az, "im1_az", self.ax1_el, "im1_el"),
-        ]:
-            if ax_az is None or ax_el is None:
-                continue
-            mat1 = _safe_literal_array(row.get(f"{prefix}_ch1", "[]"))
-            mat2 = _safe_literal_array(row.get(f"{prefix}_ch2", "[]"))
-            mat3 = _safe_literal_array(row.get(f"{prefix}_ch3", "[]"))
-            if not (mat1.size and mat2.size and mat3.size):
-                continue
-            rd1 = _compute_rd_complex(mat1, win_rng)
-            rd2 = _compute_rd_complex(mat2, win_rng)
-            rd3 = _compute_rd_complex(mat3, win_rng)
-            _render_one(ax_az, az_attr, _capon_angle_map(rd1, rd3))
-            _render_one(ax_el, el_attr, _capon_angle_map(rd2, rd3))
 
     # ---------- View update ----------
     def _update_view(self, idx: int):
@@ -3336,11 +2792,11 @@ class S3TaggerWindow:
             mode = (self.plot_mode_var.get() or "Range FFT").strip()
             self._ensure_plot_mode(mode)
 
-            row = self.df.iloc[idx]
-            win_rng = np.hanning(int(self.range_axis.size * 2)).astype(np.float32)
-
             if mode == "Doppler FFT":
                 # Compute Doppler map on-demand for this frame. Average magnitude across 3 channels.
+                row = self.df.iloc[idx]
+                win_rng = np.hanning(int(self.range_axis.size * 2)).astype(np.float32)
+
                 def rd_for_device(prefix: str):
                     rd_list = []
                     vel_axis = None
@@ -3386,6 +2842,8 @@ class S3TaggerWindow:
                 else:
                     self.im1.set_data(rd1_db)
                     self.im1.set_extent(extent1)
+
+                self.canvas.draw()
             else:
                 # Range FFT (precomputed)
                 if self.dev0_mag is not None and self.dev1_mag is not None:
@@ -3402,10 +2860,7 @@ class S3TaggerWindow:
                         self.line1.set_data(self.range_axis, y1)
                         self.ax1.relim()
                         self.ax1.autoscale_view()
-
-            if getattr(self, "ax0_az", None) is not None:
-                self._render_capon_maps(row, win_rng)
-            self.canvas.draw()
+                    self.canvas.draw()
 
         # video
         if self.video_loaded and self.video_cap is not None and cv2 is not None and Image is not None and ImageTk is not None:
@@ -3485,7 +2940,7 @@ class S3TaggerWindow:
                 if not isinstance(ranges, list):
                     ranges = [ranges]
 
-                radar = "both"
+                radar = "dev0"
                 act = left
                 if "|" in left:
                     act, radar = [x.strip() for x in left.split("|", 1)]
